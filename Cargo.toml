@@ -18,7 +18,9 @@ repository = "https://github.com/SirHexa10t/arterminal"
 #     A bare "0.16" is free to resolve to 0.16.0, which has no RGB at all, and the failure
 #     would be a missing method rather than anything a reader could guess from the manifest.
 #   * 0.16.6 fixed `truncate_str` panicking mid-character, and fixed truncation measurement in
-#     visible columns. `ui::render`'s clipping is built out of exactly that machinery.
+#     visible columns. `ui::render`'s clipping was built out of exactly that machinery; it has
+#     since become its own (`ui::clip`, which measures East Asian Ambiguous characters both
+#     ways), so this half of the floor is history — kept, since nothing is gained by lowering it.
 # (There is deliberately no 0.16.5 here: it exists as a GitHub release but was never published
 # to crates.io, so the published line runs 0.16.4 -> 0.16.6.)
 #
@@ -27,6 +29,13 @@ repository = "https://github.com/SirHexa10t/arterminal"
 # `chars().count()` and its per-character width to a hardcoded 1. Every glyph this crate exists
 # to draw is non-ASCII, and nothing would fail to compile — the grid would just shear.
 console = "0.16.6"
+
+# Display widths as a terminal set to draw East Asian Ambiguous characters two columns wide
+# draws them — `width_cjk`, which `console`'s own measurement never asks for. The frame must
+# never be wider than the terminal, and on such a terminal `·`, `—` and `…` take two columns
+# each; see `ui::clip`. Already in the tree at this version via `console`, so it costs nothing
+# new.
+unicode-width = "0.2"
 
 # One blocking `poll` while waiting for a key — the guarantee that an idle picker costs 0% CPU
 # lives here rather than inside a dependency's key-reading internals. Already in the tree via

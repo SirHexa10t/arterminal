@@ -166,12 +166,21 @@ pub enum Decoded {
     /// `CSI ? … c`: the primary device attributes. Every terminal answers this one, which is what
     /// makes it the end marker for the protocol query.
     DeviceAttributes,
+    /// Where the cursor is, 1-based, in answer to a position request. The private shape,
+    /// `CSI ? r ; c R`, is always one; the plain `CSI r ; c R` is spelled exactly like a modified
+    /// F3, so it counts only while [`Decoder::expect_cursor_report`] says one is awaited.
+    CursorPosition {
+        row: u32,
+        col: u32,
+    },
 }
 
 /// A parser that remembers an incomplete sequence between reads.
 #[derive(Debug, Default)]
 pub struct Decoder {
     pending: Vec<u8>,
+    /// Whether a cursor-position request is out — see [`Decoded::CursorPosition`].
+    cursor_report: bool,
 }
 
 /// Longest escape sequence worth waiting for. Anything longer without a final byte is garbage —
@@ -183,6 +192,12 @@ impl Decoder {
         Self::default()
     }
 
+    /// Read a plain `CSI r ; c R` as the answer to a cursor-position request rather than as a
+    /// modified F3 — to be on only while such a request is out, since the bytes are the same.
+    pub fn expect_cursor_report(&mut self, expect: bool) {
+        self.cursor_report = expect;
+    }
+
     /// Decode as much as `bytes` completes. An unfinished sequence at the end is kept for the next
     /// call — or for [`Decoder::flush`], if the caller decides nothing more is coming.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Decoded> {
@@ -190,7 +205,7 @@ impl Decoder {
         let mut out = Vec::new();
         let mut at = 0;
         while at < self.pending.len() {
-            match parse(&self.pending[at..]) {
+            match parse(&self.pending[at..], self.cursor_report) {
                 Step::Done(len, decoded) => {
                     out.extend(decoded);
                     at += len;
@@ -243,16 +258,18 @@ fn key(code: KeyCode, mods: Mods, kind: KeyKind) -> Option<Decoded> {
     Some(Decoded::Key(KeyEvent { code, kind, mods, text: None }))
 }
 
-fn parse(bytes: &[u8]) -> Step {
+/// One unit from the front of `bytes`. `cursor_report` says a position request is out — see
+/// [`Decoded::CursorPosition`].
+fn parse(bytes: &[u8], cursor_report: bool) -> Step {
     match bytes {
         [] => Step::Partial,
         [0x1b] => Step::Partial,
-        [0x1b, b'[', ..] => parse_csi(bytes),
+        [0x1b, b'[', ..] => parse_csi(bytes, cursor_report),
         [0x1b, b'O', ..] => parse_ss3(bytes),
         // Escape pressed twice: the first is a key of its own.
         [0x1b, 0x1b, ..] => Step::Done(1, key(KeyCode::Escape, Mods::default(), KeyKind::Press)),
         // `ESC` before anything else is Alt held on that key.
-        [0x1b, rest @ ..] => match parse(rest) {
+        [0x1b, rest @ ..] => match parse(rest, cursor_report) {
             Step::Done(len, Some(Decoded::Key(mut event))) => {
                 event.mods.alt = true;
                 event.text = None;
@@ -324,7 +341,7 @@ fn letter_key(letter: u8) -> Option<KeyCode> {
 }
 
 /// `ESC [` … final byte.
-fn parse_csi(bytes: &[u8]) -> Step {
+fn parse_csi(bytes: &[u8], cursor_report: bool) -> Step {
     // The Linux console's F1–F5: `ESC [ [ A` … `ESC [ [ E`. `[` is itself a legal final byte,
     // so this has to be recognised before the general scan would end the sequence on it.
     if bytes.get(2) == Some(&b'[') {
@@ -340,12 +357,12 @@ fn parse_csi(bytes: &[u8]) -> Step {
     };
     let end = 2 + offset;
     let body = std::str::from_utf8(&bytes[2..end]).unwrap_or("");
-    Step::Done(end + 1, csi(body, bytes[end]))
+    Step::Done(end + 1, csi(body, bytes[end], cursor_report))
 }
 
 /// A parsed CSI: its private marker, if any, then parameters split on `;` and sub-parameters on
 /// `:`. Empty fields stay empty, so "absent" and "zero" remain distinguishable.
-fn csi(body: &str, final_byte: u8) -> Option<Decoded> {
+fn csi(body: &str, final_byte: u8, cursor_report: bool) -> Option<Decoded> {
     let (private, params) = match body.as_bytes().first() {
         Some(b'?' | b'>' | b'<' | b'=') => (body.as_bytes()[0], &body[1..]),
         _ => (0, body),
@@ -358,6 +375,14 @@ fn csi(body: &str, final_byte: u8) -> Option<Decoded> {
     match (private, final_byte) {
         (b'?', b'u') => return Some(Decoded::KeyboardFlags(number(0, 0).unwrap_or(0))),
         (b'?', b'c') => return Some(Decoded::DeviceAttributes),
+        // The private shape, with or without a page number after the column, is only ever an
+        // answer; the plain one only while an answer is awaited.
+        (b'?', b'R') => {
+            return Some(Decoded::CursorPosition { row: number(0, 0)?, col: number(1, 0)? })
+        }
+        (0, b'R') if cursor_report => {
+            return Some(Decoded::CursorPosition { row: number(0, 0)?, col: number(1, 0)? })
+        }
         (0, _) => {}
         _ => return None, // some other private reply this program never asked for
     }
@@ -628,6 +653,25 @@ mod tests {
         let out = decoder.feed(b"\x1b[?1u\x1b[?62;22c");
         assert_eq!(out, [Decoded::KeyboardFlags(1), Decoded::DeviceAttributes]);
         assert_eq!(Decoder::new().feed(b"\x1b[?64;1;2c"), [Decoded::DeviceAttributes]);
+    }
+
+    /// A cursor report in the private shape is always an answer — even arriving late, after the
+    /// question's end marker, it is never mistaken for a key — while the plain shape, which is
+    /// byte for byte a modified F3, is an answer only while one is awaited.
+    #[test]
+    fn a_cursor_report_is_read_as_one_only_where_it_cannot_be_a_key() {
+        let mut decoder = Decoder::new();
+        let at = |row, col| Decoded::CursorPosition { row, col };
+        assert_eq!(decoder.feed(b"\x1b[?1;3R"), [at(1, 3)]);
+        assert_eq!(decoder.feed(b"\x1b[?12;40;1R"), [at(12, 40)], "with a page number");
+        let shift_f3 = KeyEvent {
+            mods: Mods { shift: true, ..Mods::default() },
+            ..KeyEvent::press(KeyCode::F(3))
+        };
+        assert_eq!(decoder.feed(b"\x1b[1;2R"), [Decoded::Key(shift_f3)], "not asked: a key");
+        decoder.expect_cursor_report(true);
+        assert_eq!(decoder.feed(b"\x1b[1;2R"), [at(1, 2)], "asked: an answer");
+        decoder.expect_cursor_report(false);
     }
 }
 

@@ -58,10 +58,12 @@
 //!
 //! # Terminal support
 //!
-//! Colours are 24-bit throughout and are emitted as such. Terminals that only do the 256-colour
-//! palette will show the nearest thing they can rather than the exact colour; down-converting
-//! for them is not yet implemented, and when it is it will happen at the point of drawing, never
-//! by narrowing what a [`Rgb`] can hold.
+//! A colour is either 24-bit, emitted as such, or one of the terminal's own 256 palette SLOTS — see
+//! [`Ink`] — kept as a slot and drawn through the terminal, so it looks as this terminal shows it.
+//! New swatches are always 24-bit. Terminals that only do the 256-colour palette will show the
+//! nearest thing they can to a 24-bit colour; down-converting for them is not yet implemented,
+//! and when it is it will happen at the point of drawing, never by narrowing what an [`Rgb`] can
+//! hold.
 
 pub mod canvas;
 pub mod color;
@@ -77,7 +79,7 @@ mod input;
 mod paint;
 
 pub use crate::canvas::{At, Canvas, CanvasError, Cell, LoadCause, LoadError};
-pub use crate::color::{ColorParseError, Hsb, Rgb, Rng};
+pub use crate::color::{ColorParseError, Hsb, Ink, Rgb, Rng};
 pub use crate::cursor::{Dir, Focus};
 pub use crate::devices::InputDevices;
 pub use crate::document::{Document, DocumentError};

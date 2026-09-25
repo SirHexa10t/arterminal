@@ -17,13 +17,14 @@ colours are written back into the same file as terminal escapes, so `cat` shows 
   ▒⣾⡇⣿⣿⡇⣾⣿⣿⣿⣿⣿⣿⣿⣿⣄⢻⣦⡀⠁⢸⡌⠻⣿⣿⣿⡽⣿⣿▒
   ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
 painting while held · modified · brush: colour 1
-^X/esc close · ^C quit · ^S save · ^Z undo · ^Y redo
-space hold to paint · backspace hold to erase · b toggle painting · del toggle erasing · i pick col…
-F6 split · shift+F6 side by side · shift+arrows scroll · pgup/pgdn page · F5 redraw
+Program: ^X/esc close · ^C quit · ^S save · ^Z undo · shift+^Z redo
+Draw:    space hold to paint · backspace hold to erase · b toggle painting · del toggle erasing · i…
+Display: F6 split · shift+F6 side by side · pgup/pgdn page · F5 redraw
 ```
 
-The swatches are blocks of their colour and `▒` is the grey border around the art; each hint line
-colours its actions, a colour per line, so a key and what it does are never run together.
+The swatches are blocks of their colour and `▒` is the grey border around the art. Each hint line
+starts with a grey title and colours its actions, a colour per line, so a key and what it does are
+never run together.
 
 ## The picker, two ways
 
@@ -51,8 +52,8 @@ arterminal examples/skull.txt
 One argument, the file to edit, and optionally `--su` — see
 [Holding through the input devices](#holding-through-the-input-devices). The picker draws on
 **stderr**; stdout carries nothing, because everything the session produces goes back into the
-file on `Ctrl+S`. Exit codes: `0` the picker ran, `2` the file or the terminal was unusable. Under
-`--su`, a sudo that refuses passes its own status through.
+file on `Ctrl+S`. Exit codes: `0` the picker ran, or you declined to open the file; `2` the file or
+the terminal was unusable. Under `--su`, a sudo that refuses passes its own status through.
 
 ## The file
 
@@ -67,14 +68,27 @@ shade<TAB>#a02020<TAB>ember<TAB>0,0,-60
 
 * **A plain text file is a valid document** with no colours and an empty palette — and a file
   that was only opened and saved comes back byte for byte.
-* **Colours are inline terminal escapes**, so printing the file shows the drawing coloured. Only
-  the 24-bit foreground sequence sets a colour; everything else in a hand-made file is passed over
-  with its text kept.
+* **Colours are inline terminal escapes**, so printing the file shows the drawing coloured. The
+  24-bit foreground sets a colour, spelled with semicolons or the ITU way with colons. Escapes are
+  cut out by the terminal's own grammar, so what loads as art is exactly what a terminal would
+  draw; everything else in a hand-made file, bold and backgrounds included, is passed over.
+* **16- and 256-colour codes are kept as slots.** They name places in the terminal's palette
+  rather than colours, so they load as slot swatches, tagged `slot 196` in the palette — the first
+  16 as `slot 3 (theme)`, since only those follow the theme — and are drawn and saved as the slot
+  they are. A slot is written as `ESC[38;5;n m`, the spelling the picker draws it in, and a slot
+  swatch as `label<TAB>slot 196`. New swatches, from `[+]` or `F2`, are always 24-bit; `F2` on a
+  slot swatch makes it one, and says so. A swatch cannot follow a slot, since what a slot looks
+  like is the terminal's to say.
 * **A file with colours but no palette still loads**: every colour found gets a swatch with a
   counted name, because every colour in a drawing must have one.
 * **Rows are trimmed of trailing spaces on save**, so a ragged drawing stays ragged.
 * Every glyph must be exactly one terminal column wide. Braille, box drawing and block elements
   are fine; emoji and CJK are rejected with a line and column. Tabs are refused.
+* **UTF-8 only.** A UTF-8 byte-order mark, which Windows editors like to write, is taken off; a
+  UTF-16 file is refused with a message saying so.
+* **A drawing past 10,000 columns or rows, or past 10 million cells, is asked about before it is
+  built**, with what it will cost in memory. Every row is padded to the widest, so one long line in
+  a small file can need a great deal. Declining exits cleanly without opening anything.
 
 The marker line is visible when the file is printed — a deliberate compromise, isolated in one
 module so it can be changed.
@@ -98,14 +112,20 @@ module so it can be changed.
 | `Shift+F6` | the same split, side by side, or join it back |||
 | `c` | in a split, show or hide the cursor on the preview |||
 | `Ctrl+S` | save to the file it was opened from |||
-| `Ctrl+Z` / `Ctrl+Y` | undo / redo — hold to keep going; a whole drag is one undo |||
+| `Ctrl+Z` / `Ctrl+Shift+Z` | undo / redo — hold to keep going; a whole drag is one undo. `Ctrl+Y` redoes too, on every terminal |||
 | `Ctrl+X` / `Esc` | close — warns first if there is unsaved work, closes on the second press |||
 | `Ctrl+C` | quit at once — unsaved work is kept in `<file>.arterminal.tmp` |||
 
-**The hint lines** under the status row follow the cursor and say only what works right now: the
-file on the first line, colour on the second, the view on the third. On a short terminal the view
-line goes first, then the colour line, so the drawing keeps at least three rows; the way out is
-never dropped.
+**The hint lines** under the status row follow the cursor and say only what works right now:
+`Program:` for the file, `Draw:` for colour and the pen, `Display:` for the view. Scrolling is
+offered only when the picture is bigger than the window. On a short terminal the display line goes
+first, then the draw line, so the drawing keeps at least three rows; on a narrow one the titles go
+before any key does. The way out is never dropped.
+
+**The memory line.** Once the picker holds more than 1 GB, a red line under the hints says how
+much, and how much of it is the image and how much the undo history. Nothing is capped: a big pen
+dragged over a large canvas records every cell it touches, about 48 bytes each, and the line is
+there so that is never a surprise. Reopening the file starts a fresh history.
 
 **Hold keys and toggle keys.** Space, Enter and Backspace work while held and never latch: the
 pen is down exactly while the key is. Held together, the last one pressed is in charge, and letting
@@ -157,8 +177,12 @@ lives on the canvas; the preview is read-only, but marks the cursor's place with
 box-drawing lines, which some terminals draw two columns wide, so with colour switched off it takes
 its cells but cannot be seen.
 
-Redo is `Ctrl+Y` rather than `Ctrl+Shift+Z`, because a classic terminal sends the same byte for
-both. The cursor does not wrap: a canvas is a plane, and holding `↑` stops at the top edge.
+**Redo** is `Ctrl+Shift+Z` wherever the terminal can tell it from `Ctrl+Z`: one that speaks the
+kitty keyboard protocol reports the Shift. A classic terminal sends the very same byte for both
+chords, so there `Ctrl+Shift+Z` can only undo, and `Ctrl+Y` is the redo. `Ctrl+Y` works on every
+terminal, and the hint line names whichever redo this one has.
+
+The cursor does not wrap: a canvas is a plane, and holding `↑` stops at the top edge.
 
 ### Holding through the input devices
 
@@ -212,15 +236,17 @@ When no device ever shows the key behind a press, arterminal says so once and th
 | `src/main.rs` | The standalone binary. |
 | `examples/skull.txt` | Sample art. |
 | `tests/stderr_gate.rs` | The one test that must write `console`'s process-wide colour switches, kept in its own process. |
+| `tests/pty.rs` | The real binary on a pseudo-terminal, with the test playing the terminal: holding, saving, salvage, `--su` without a terminal, the startup questions, width measuring. |
 | `*_img_test.txt` | Sample art at two sizes. |
 
 ## Design notes
 
-**Two dependencies**, `console` and `libc`, each with its reason written into `Cargo.toml`.
-`console` is pinned at `0.16.6` rather than `0.16` for two independent reasons recorded there —
-24-bit colour only arrived in `0.16.2`, and `0.16.6` fixed the truncation machinery the width
-clipping is built from. Its default features are load-bearing: dropping them silently degrades
-width measurement to `chars().count()`, with no compile error and a sheared grid at runtime.
+**Three dependencies**, `console`, `libc` and `unicode-width`, each with its reason written into
+`Cargo.toml`; the last two were already in the tree through `console`. `console` is pinned at
+`0.16.6` rather than `0.16`: 24-bit colour only arrived in `0.16.2`, and `0.16.6` fixed the
+truncation the clipping was first built on, before it became its own. Its default features are
+load-bearing: dropping them silently degrades width measurement to `chars().count()`, with no
+compile error and a sheared grid at runtime.
 
 **Rendering and key handling are pure functions.** `ui::render` turns state into lines and
 `ui::apply` turns a keystroke into a change; `ui::run` is the small impure loop that connects
@@ -293,13 +319,28 @@ ends with a newline, the last one included. Neither limit is silent: art that do
 with the status row saying which rows and columns are showing, and any other line too wide ends in
 `…`.
 
+**Widths are measured the terminal's way.** Some terminals draw East Asian Ambiguous characters —
+`·`, `—`, `…`, block elements — two columns wide, and a line measured the narrow way would then
+wrap and throw every later row off. At startup arterminal draws a `·`, asks the terminal where the
+cursor went, and erases it again; the locale is used only when the terminal gives no answer. Every
+line is then clipped to what the terminal really draws. This changes only the measuring, never
+which glyphs a canvas accepts, so a file loads the same on every machine. On a terminal set wide,
+art using such glyphs looks sheared, since each takes two columns there, but the frame keeps its
+place.
+
 **Compose style attributes; never concatenate escape strings.** A rendered string contains its
 own `\x1b[0m`, and a reset inside a hand-rolled reverse-video wrapper ends the inversion partway
 along the run — so wrapping obliges every site to re-arm after each embedded reset, and one
 forgotten site is a bug. Nothing here wraps: focus on a swatch is a plain-text gutter mark beside
-the colour rather than around it, and a canvas cell folds ink and inversion into a single style
-applied to a single `char`, which cannot contain a reset. The full rule, and the future feature
-most likely to break it, are in the `ui` module docs.
+the colour rather than around it, and a run of canvas cells folds ink and inversion into a single
+style applied once to their glyphs, which are plain characters and cannot contain a reset. The
+full rule, and the future feature most likely to break it, are in the `ui` module docs.
+
+**A frame costs what it shows, not what is painted.** Every keystroke redraws the whole frame, so
+what matters is its size in bytes. Cells that look alike are drawn as one styled run rather than a
+colour escape each, which took a 6×6 pen dragged over the large sample art from 34 KB a frame to
+7 KB, about what the same picture costs unpainted. The pen's own arithmetic is a microsecond or
+two per move at any size.
 
 **Colour is identity; a label is a name.** No two swatches may hold the same colour, because a
 canvas cell records the colour itself rather than a reference — so if two shared one, nothing

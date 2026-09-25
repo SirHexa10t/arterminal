@@ -27,8 +27,9 @@
 //!
 //! Nothing here wraps, so the whole failure is unreachable rather than merely avoided: a swatch
 //! row expresses focus as a plain-text gutter mark beside the coloured block instead of around
-//! it, and a canvas cell folds ink and inversion into a single style applied to a single `char` —
-//! and a `char` cannot contain a reset.
+//! it, and a run of canvas cells folds ink and inversion into a single style applied once to
+//! their glyphs — plain characters, since the canvas refuses control characters, and so unable
+//! to contain a reset.
 //!
 //! THE CHANGE THAT WOULD BREAK THIS is the first feature needing to highlight a MULTI-CELL RUN: a
 //! selection rectangle, a focused swatch shown inverted rather than gutter-marked, a status line
@@ -37,14 +38,13 @@
 //! inversion composed into each cell's style. It costs more allocations and it cannot go wrong.
 
 use crate::canvas::{Canvas, Cell, LoadCause, LoadError};
-use crate::color::{Rgb, Rng};
+use crate::color::{Ink, Rgb, Rng};
 use crate::cursor::{Dir, Focus};
 use crate::document;
 use crate::keys::{KeyCode, KeyEvent, KeyKind};
 use crate::palette::{Palette, PaletteError, Recolour, Swatch};
 use crate::{input, paint};
 use console::Term;
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -81,6 +81,13 @@ pub struct Picker {
     /// [`run`] from what the terminal answered; `false` for a picker driven any other way. Only
     /// the hint reads it — [`apply`] needs no mode, see there.
     hold_keys: bool,
+    /// Whether the terminal reports Shift on a Ctrl chord, so Ctrl+Shift+Z is not Ctrl+Z. Set by
+    /// [`run`]; only the hint reads it, to name the redo key this terminal can actually send.
+    shift_on_ctrl: bool,
+    /// Whether the terminal draws East Asian Ambiguous characters — `·`, `—`, `…`, block
+    /// elements — two columns wide. Set by [`run`], which asks the terminal; [`render`] measures
+    /// and clips every line by it, so no line is ever wider than the terminal draws it.
+    wide_ambiguous: bool,
     /// Whether the art is shown split — a solid-colour canvas to paint on, and the coloured art
     /// beside or under it as a preview — rather than as one picture. F6 and Shift+F6 choose.
     split: Option<Split>,
@@ -96,6 +103,9 @@ pub struct Picker {
     quit_armed: bool,
     /// Where a save goes. Set by [`Picker::open`], absent for a picker built in code.
     path: Option<PathBuf>,
+    /// Past this many bytes in all, a red line under the hints says where the memory goes. See
+    /// [`MEMORY_WARNING_ABOVE`].
+    memory_warning_above: usize,
 }
 
 impl Picker {
@@ -114,12 +124,15 @@ impl Picker {
             view: View::default(),
             editing: None,
             hold_keys: false,
+            shift_on_ctrl: false,
+            wide_ambiguous: false,
             split: None,
             art_cursor: true,
             history: History::default(),
             notice: None,
             quit_armed: false,
             path: None,
+            memory_warning_above: MEMORY_WARNING_ABOVE,
         }
     }
 
@@ -127,9 +140,16 @@ impl Picker {
     /// out — and remember the path so [`Picker::save`] knows where to go.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LoadError> {
         let path = path.as_ref();
+        Self::from_text(path, &document::read(path)?)
+    }
+
+    /// [`Picker::open`] for a file already read — by [`document::read`], say, so that it could
+    /// be [measured](document::measure) first. `path` is where it came from, and where a save
+    /// will go.
+    pub fn from_text(path: impl AsRef<Path>, text: &str) -> Result<Self, LoadError> {
+        let path = path.as_ref();
         let at = |source| LoadError { path: path.to_path_buf(), source };
-        let text = std::fs::read_to_string(path).map_err(|err| at(LoadCause::Io(err)))?;
-        let doc = document::parse(&text).map_err(|err| at(LoadCause::Document(err)))?;
+        let doc = document::parse(text).map_err(|err| at(LoadCause::Document(err)))?;
         let mut picker = Self::new(doc.canvas).with_palette(doc.palette);
         picker.path = Some(path.to_path_buf());
         Ok(picker)
@@ -185,6 +205,37 @@ impl Picker {
         self.pen
     }
 
+    /// Where the memory this picker holds goes: the drawing, and everything undo and redo can
+    /// reach. Both as allocated, not as used — what the machine is really paying.
+    pub fn memory(&self) -> Memory {
+        Memory { image: self.canvas.bytes(), history: self.history.bytes() }
+    }
+
+    /// Past how many bytes in all the red memory line appears — [`MEMORY_WARNING_ABOVE`] unless
+    /// a caller that knows its machine says otherwise. Nothing is ever capped; the line informs.
+    pub fn set_memory_warning_above(&mut self, bytes: usize) {
+        self.memory_warning_above = bytes;
+    }
+
+    fn warns_of_memory(&self) -> bool {
+        self.memory().total() > self.memory_warning_above
+    }
+
+    /// The red line under the hints, once memory passes the line: how much is the image and how
+    /// much the undo history, since those are the two things a person can do something about.
+    fn memory_warning(&self) -> Option<String> {
+        let memory = self.memory();
+        self.warns_of_memory().then(|| {
+            format!(
+                "memory {}: the image {}, the undo history {}; reopening the file starts a fresh \
+                 history",
+                readable_bytes(memory.total()),
+                readable_bytes(memory.image),
+                readable_bytes(memory.history),
+            )
+        })
+    }
+
     /// How many cells a side the pen covers — see [`Picker::grow_pen`].
     pub fn pen_size(&self) -> usize {
         self.pen_size
@@ -225,6 +276,24 @@ impl Picker {
     /// caller running its own loop that has found out for itself.
     pub fn set_hold_keys(&mut self, hold_keys: bool) {
         self.hold_keys = hold_keys;
+    }
+
+    /// Say whether the terminal reports Shift on a Ctrl chord — normally [`run`]'s to know. Only
+    /// the hint changes: Ctrl+Shift+Z redoes whenever it arrives, and Ctrl+Y always does.
+    pub fn set_shift_on_ctrl(&mut self, shift_on_ctrl: bool) {
+        self.shift_on_ctrl = shift_on_ctrl;
+    }
+
+    /// Say whether the terminal draws East Asian Ambiguous characters two columns wide —
+    /// normally [`run`]'s to find out, by asking the terminal.
+    ///
+    /// This changes only how [`render`] MEASURES, never which glyphs a canvas accepts: that rule
+    /// is the file's, one cell per glyph by the narrow width, so a drawing loads the same on every
+    /// machine. On a terminal set wide, a drawing that uses such glyphs looks sheared — each takes
+    /// two columns there, which nothing here can change — but the frame is clipped to what the
+    /// terminal really draws, so it never wraps and never loses its place.
+    pub fn set_wide_ambiguous(&mut self, wide: bool) {
+        self.wide_ambiguous = wide;
     }
 
     /// The label being typed, if a swatch is being renamed right now.
@@ -295,14 +364,14 @@ impl Picker {
         true
     }
 
-    fn brush_color(&self) -> Option<Rgb> {
+    fn brush_color(&self) -> Option<Ink> {
         self.brush.as_deref().and_then(|b| self.palette.get(b)).map(Swatch::color)
     }
 
     /// Set every cell the pen covers to `to`, recording what each was. A tap with a big pen is
     /// still ONE edit: outside a stroke, the cells it changes are folded together here, exactly
     /// as a stroke's are when its pen lifts.
-    fn ink_footprint(&mut self, to: Option<Rgb>) -> bool {
+    fn ink_footprint(&mut self, to: Option<Ink>) -> bool {
         let Some(Footprint { xs, ys }) = self.footprint() else { return false };
         let own_stroke = !self.history.in_stroke();
         if own_stroke {
@@ -515,8 +584,16 @@ impl Picker {
             return Err(PaletteError::UnknownLabel { label: format!("row {at}") });
         };
         let (label, from) = (swatch.label().to_string(), swatch.color());
-        let to = self.palette.free_random_color(&mut self.rng)?;
+        let to = Ink::Rgb(self.palette.free_random_color(&mut self.rng)?);
         self.set_swatch_color(&label, to)?;
+        // A re-roll is always a colour of its own, so a slot swatch stops being one — said out
+        // loud, because the swatch then looks the same everywhere and no longer follows the
+        // terminal's palette, which is not something a re-roll ever did before.
+        if let Ink::Slot(slot) = from {
+            self.notice = Some(format!(
+                "{label:?} is a colour of its own now, no longer the terminal's slot {slot}"
+            ));
+        }
         self.history.push(Edit::Recolour { label, from, to });
         Ok(())
     }
@@ -538,14 +615,14 @@ impl Picker {
     /// since taken, and undoing a rename on a name since reused.
     pub fn undo(&mut self) -> bool {
         self.lift_pen();
-        let Some(edit) = self.history.done.pop() else { return false };
+        let Some(edit) = self.history.take_done() else { return false };
         match self.reverse(&edit) {
             Ok(()) => {
-                self.history.undone.push(edit);
+                self.history.put_undone(edit);
                 true
             }
             Err(why) => {
-                self.history.done.push(edit);
+                self.history.put_done(edit);
                 self.notice = Some(format!("cannot undo: {why}"));
                 false
             }
@@ -555,14 +632,14 @@ impl Picker {
     /// Put back the last edit taken back. `false` when there is none, or it no longer can be.
     pub fn redo(&mut self) -> bool {
         self.lift_pen();
-        let Some(edit) = self.history.undone.pop() else { return false };
+        let Some(edit) = self.history.take_undone() else { return false };
         match self.forward(&edit) {
             Ok(()) => {
-                self.history.done.push(edit);
+                self.history.put_done(edit);
                 true
             }
             Err(why) => {
-                self.history.undone.push(edit);
+                self.history.put_undone(edit);
                 self.notice = Some(format!("cannot redo: {why}"));
                 false
             }
@@ -629,7 +706,11 @@ impl Picker {
     ///
     /// Refused whole if the move would put two swatches on one colour — nothing is changed in the
     /// palette, the canvas or the history. See [`Palette::set_color`].
-    pub fn set_swatch_color(&mut self, label: &str, color: Rgb) -> Result<Recolour, PaletteError> {
+    pub fn set_swatch_color(
+        &mut self,
+        label: &str,
+        color: impl Into<Ink>,
+    ) -> Result<Recolour, PaletteError> {
         let recolour = self.palette.set_color(label, color)?;
         for (was, now) in recolour.changes() {
             for cell in self.canvas.cells_mut() {
@@ -745,7 +826,7 @@ impl Picker {
     /// Pure, so [`render`] can call it on a borrowed picker and always show the cursor, and
     /// [`run`] can store the answer so the next frame starts from where this one ended.
     pub fn scrolled(&self, width: usize, height: usize) -> View {
-        let rows = body_rows(height);
+        let rows = body_rows(height, self.warns_of_memory());
         let cols = pane_columns(width, self.split);
         let mut view = self.view;
         view.rows = rows.max(1);
@@ -772,8 +853,8 @@ impl Picker {
 }
 
 /// Body lines on screen for a terminal `height` rows tall: all of it but the pinned footer.
-fn body_rows(height: usize) -> usize {
-    height.saturating_sub(footer(height).len())
+fn body_rows(height: usize, memory_warning: bool) -> usize {
+    height.saturating_sub(footer(height, memory_warning).len())
 }
 
 /// One line of the footer.
@@ -787,6 +868,9 @@ enum FooterLine {
     Colour,
     /// Keys for what is on screen: the split, the window over a big picture, a redraw.
     View,
+    /// Where the memory goes, in red, once there is a great deal of it — see
+    /// [`MEMORY_WARNING_ABOVE`]. Only while there is.
+    Memory,
 }
 
 /// Rows the drawing keeps before the footer spends any on its second and third hint lines.
@@ -798,17 +882,28 @@ const MIN_BODY_ROWS: usize = 3;
 /// The footer of a terminal `height` rows tall, top to bottom — PINNED at every height, and shed
 /// from what is least needed when there is no room. The file line is the last to go, because it
 /// says how to leave, and that is never the thing to scroll away. The status goes before it,
-/// because a pen that is down without the person knowing paints where they do not mean to. The
-/// other two hint lines come and go with the room the drawing keeps: see [`MIN_BODY_ROWS`].
-fn footer(height: usize) -> &'static [FooterLine] {
-    use FooterLine::{Colour, File, Status, View};
-    match height {
-        0 => &[],
-        1 => &[File],
-        h if h < 3 + MIN_BODY_ROWS => &[Status, File],
-        h if h < 4 + MIN_BODY_ROWS => &[Status, File, Colour],
-        _ => &[Status, File, Colour, View],
+/// because a pen that is down without the person knowing paints where they do not mean to.
+///
+/// The memory warning, while there is one, comes next: it is news rather than help, so it takes a
+/// row before the other two hint lines do, and it sits at the very bottom, under all of them.
+/// Those two come and go with the room the drawing keeps: see [`MIN_BODY_ROWS`].
+fn footer(height: usize, memory_warning: bool) -> Vec<FooterLine> {
+    use FooterLine::{Colour, File, Memory, Status, View};
+    let mut lines = match height {
+        0 => Vec::new(),
+        1 => vec![File],
+        _ => vec![Status, File],
+    };
+    if memory_warning && height > lines.len() {
+        lines.push(Memory);
     }
+    for hint in [Colour, View] {
+        if height >= lines.len() + 1 + MIN_BODY_ROWS {
+            let above_the_warning = lines.len() - usize::from(lines.last() == Some(&Memory));
+            lines.insert(above_the_warning, hint);
+        }
+    }
+    lines
 }
 
 /// Art columns on screen for a terminal `width` columns wide — in EACH pane, when the canvas and
@@ -870,6 +965,46 @@ impl Default for View {
     fn default() -> Self {
         Self { top: 0, left: 0, follow: true, rows: 1 }
     }
+}
+
+/// Where a picker's memory goes — see [`Picker::memory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Memory {
+    /// The canvas: a cell for every column of every row.
+    pub image: usize,
+    /// Everything undo and redo can reach, and the lists that hold it.
+    pub history: usize,
+}
+
+impl Memory {
+    pub fn total(self) -> usize {
+        self.image + self.history
+    }
+}
+
+/// Past this much memory — the image and its undo history together — a red line under the hints
+/// says so, and says which is which.
+///
+/// A gigabyte: far past what ordinary art needs — a 200 × 80 drawing is 128 KB, and a long
+/// session's history a few megabytes — so the line only ever appears for something out of the
+/// ordinary, such as a big pen dragged over a very large canvas, which records every cell it
+/// touches; and well before a typical machine of 8 to 16 GB starts to strain. Nothing is capped:
+/// the line informs, and the person decides.
+pub const MEMORY_WARNING_ABOVE: usize = 1_000_000_000;
+
+/// A number of bytes as a person reads one: 480.0 KB, 1.2 GB. Decimal units, as disks and the
+/// question before opening a large file count them.
+pub fn readable_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} bytes");
+    }
+    let (mut value, mut unit) = (bytes as f64 / 1000.0, 0);
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// How a split view lays out its two halves: the canvas, where every cell is a solid block of its
@@ -941,21 +1076,21 @@ enum Edit {
     Paint {
         x: usize,
         y: usize,
-        from: Option<Rgb>,
-        to: Option<Rgb>,
+        from: Option<Ink>,
+        to: Option<Ink>,
     },
     /// Everything painted while the pen was down, so one drag is one undo.
     Stroke(Vec<Edit>),
     AddSwatch {
         label: String,
-        color: Rgb,
+        color: Ink,
     },
     /// A swatch's move. Kept as its own truth and never rewritten by [`History::recolour`]: a
     /// later move of the same swatch is a separate entry, and undoing in order walks them back.
     Recolour {
         label: String,
-        from: Rgb,
-        to: Rgb,
+        from: Ink,
+        to: Ink,
     },
     /// Not rewritten by [`History::rename`] either, for the same reason — each holds exactly the
     /// names in force at its moment, and last-in-first-out order keeps that true.
@@ -963,6 +1098,22 @@ enum Edit {
         from: String,
         to: String,
     },
+}
+
+impl Edit {
+    /// Bytes this edit keeps on the heap beyond its own slot in a list: a stroke's list of parts
+    /// and whatever those keep, and the labels a swatch's edit carries.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Edit::Paint { .. } => 0,
+            Edit::Stroke(parts) => {
+                parts.capacity() * std::mem::size_of::<Edit>()
+                    + parts.iter().map(Edit::heap_bytes).sum::<usize>()
+            }
+            Edit::AddSwatch { label, .. } | Edit::Recolour { label, .. } => label.capacity(),
+            Edit::Rename { from, to } => from.capacity() + to.capacity(),
+        }
+    }
 }
 
 /// What has been done, what has been taken back, and where the file last agreed with it.
@@ -978,6 +1129,12 @@ struct History {
     /// Without that, undoing to the save point and editing again could leave `done` the same
     /// LENGTH as when saved with different CONTENT, and the picker would call itself clean.
     saved_at: Option<usize>,
+    /// What each list keeps on the heap beyond its own slots — every stroke's list of parts,
+    /// every label an edit carries — as running totals, since adding them up afresh would walk
+    /// millions of edits on every frame. Every change to either list goes through a method here
+    /// that keeps these true. See [`History::bytes`].
+    done_heap: usize,
+    undone_heap: usize,
 }
 
 impl Default for History {
@@ -986,7 +1143,14 @@ impl Default for History {
     /// report itself dirty — which is exactly what happened before this was spelled out, and a
     /// live run found it as "Esc on a just-opened file warns about unsaved work".
     fn default() -> Self {
-        Self { done: Vec::new(), undone: Vec::new(), stroke_start: None, saved_at: Some(0) }
+        Self {
+            done: Vec::new(),
+            undone: Vec::new(),
+            stroke_start: None,
+            saved_at: Some(0),
+            done_heap: 0,
+            undone_heap: 0,
+        }
     }
 }
 
@@ -996,7 +1160,44 @@ impl History {
             self.saved_at = None;
         }
         self.undone.clear();
+        self.undone_heap = 0;
+        self.done_heap += edit.heap_bytes();
         self.done.push(edit);
+    }
+
+    /// The last edit done, taken off to be undone.
+    fn take_done(&mut self) -> Option<Edit> {
+        let edit = self.done.pop()?;
+        self.done_heap -= edit.heap_bytes();
+        Some(edit)
+    }
+
+    /// An edit put back on the done list — redone, or an undo that failed — leaving what can be
+    /// redone alone, which [`History::push`] would not.
+    fn put_done(&mut self, edit: Edit) {
+        self.done_heap += edit.heap_bytes();
+        self.done.push(edit);
+    }
+
+    /// The last edit undone, taken off to be redone.
+    fn take_undone(&mut self) -> Option<Edit> {
+        let edit = self.undone.pop()?;
+        self.undone_heap -= edit.heap_bytes();
+        Some(edit)
+    }
+
+    /// An edit put on the undone list — undone, or a redo that failed.
+    fn put_undone(&mut self, edit: Edit) {
+        self.undone_heap += edit.heap_bytes();
+        self.undone.push(edit);
+    }
+
+    /// What the history keeps in memory: both lists' own slots, as allocated, and everything that
+    /// hangs off them — see [`Edit::heap_bytes`].
+    fn bytes(&self) -> usize {
+        (self.done.capacity() + self.undone.capacity()) * std::mem::size_of::<Edit>()
+            + self.done_heap
+            + self.undone_heap
     }
 
     fn is_dirty(&self) -> bool {
@@ -1023,14 +1224,25 @@ impl History {
         match parts.len() {
             0 => {}
             1 => self.done.push(parts.remove(0)),
-            _ => self.done.push(Edit::Stroke(parts)),
+            _ => {
+                // The parts' own heap is counted already, from when they were entries of their
+                // own; only the list that holds them now is new.
+                self.done_heap += parts.capacity() * std::mem::size_of::<Edit>();
+                self.done.push(Edit::Stroke(parts));
+            }
+        }
+        // A long stroke grew `done` to hold every cell it touched, and folding them into one entry
+        // leaves that room empty. Give it back: it is not history, and kept, it would be counted
+        // as history and cost as much again as the stroke itself.
+        if self.done.capacity() > 2 * self.done.len() + 64 {
+            self.done.shrink_to_fit();
         }
     }
 
     /// Carry a swatch's move into every edit that mentions its old colour.
-    fn recolour(&mut self, was: Rgb, now: Rgb) {
-        fn visit(edit: &mut Edit, was: Rgb, now: Rgb) {
-            let swap = |ink: &mut Option<Rgb>| {
+    fn recolour(&mut self, was: Ink, now: Ink) {
+        fn visit(edit: &mut Edit, was: Ink, now: Ink) {
+            let swap = |ink: &mut Option<Ink>| {
                 if *ink == Some(was) {
                     *ink = Some(now);
                 }
@@ -1057,12 +1269,17 @@ impl History {
 
     /// Carry a swatch's new name into every edit that held the old one.
     fn rename(&mut self, from: &str, to: &str) {
-        for edit in self.done.iter_mut().chain(self.undone.iter_mut()) {
-            match edit {
-                Edit::AddSwatch { label, .. } | Edit::Recolour { label, .. } if label == from => {
-                    *label = to.to_string();
+        let lists =
+            [(&mut self.done, &mut self.done_heap), (&mut self.undone, &mut self.undone_heap)];
+        for (list, heap) in lists {
+            for edit in list.iter_mut() {
+                if let Edit::AddSwatch { label, .. } | Edit::Recolour { label, .. } = edit {
+                    if label == from {
+                        *heap -= label.capacity();
+                        *label = to.to_string();
+                        *heap += label.capacity();
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -1129,7 +1346,7 @@ const GUTTER: usize = 2;
 /// What an uncoloured cell is drawn as on the split view's canvas: black, as asked for, and
 /// explicit rather than the terminal's own background, so the canvas reads as a rectangle on a
 /// light theme too.
-const UNINKED: Rgb = Rgb::new(0, 0, 0);
+const UNINKED: Ink = Ink::Rgb(Rgb::new(0, 0, 0));
 
 /// The split view's cursor. ASCII, so it is one column wide on every terminal.
 const BLOCK_CURSOR: char = '+';
@@ -1145,7 +1362,7 @@ const BLOCK_CURSOR: char = '+';
 const BORDER: Rgb = Rgb::new(110, 110, 110);
 
 /// Marks a line the terminal was too narrow to show whole.
-const CLIPPED: &str = "…";
+const CLIPPED: char = '…';
 
 /// Shown beside a label being typed. ASCII on purpose: the arrows and shapes that would look
 /// nicer here are East Asian Ambiguous width, and a prompt that shears the row on some
@@ -1170,7 +1387,9 @@ pub fn render(picker: &Picker, width: usize, height: usize) -> Vec<String> {
     }
     let focus = picker.focus;
     let view = picker.scrolled(width, height);
-    let (rows, cols) = (body_rows(height), pane_columns(width, picker.split));
+    let memory_warning = picker.memory_warning();
+    let rows = body_rows(height, memory_warning.is_some());
+    let cols = pane_columns(width, picker.split);
     let window = view.left..(view.left + cols).min(picker.canvas.width());
     let footprint = picker.footprint();
 
@@ -1197,22 +1416,38 @@ pub fn render(picker: &Picker, width: usize, height: usize) -> Vec<String> {
                 let row = picker.canvas.row(y).expect("inside the preview");
                 let cursor = footprint.as_ref().and_then(|f| f.on_row(y));
                 let cursor = cursor.filter(|_| picker.art_cursor);
-                framed(NO_MARK, &[preview_cells(row, cursor, window.clone())])
+                framed(NO_MARK, &[art_cells(row, cursor, window.clone(), CursorLook::Marker)])
             }
         })
         .collect();
 
     // The footer is pinned at every height, and sheds what matters least first — see [`footer`].
-    for line in footer(height) {
+    // Scrolling is offered only when there is somewhere to scroll to.
+    let scrollable = picker.body_len() > rows || picker.canvas.width() > cols;
+    for line in footer(height, memory_warning.is_some()) {
         lines.push(match line {
             FooterLine::Status => status(picker, &view, shown.clone(), window.clone()),
-            FooterLine::File => hint_line(&file_hints(picker), FILE_INK),
-            FooterLine::Colour => hint_line(&colour_hints(picker), COLOUR_INK),
-            FooterLine::View => hint_line(&view_hints(picker), VIEW_INK),
+            FooterLine::File => {
+                hint_line("Program:", &file_hints(picker), FILE_INK, width, picker.wide_ambiguous)
+            }
+            FooterLine::Colour => {
+                hint_line("Draw:", &colour_hints(picker), COLOUR_INK, width, picker.wide_ambiguous)
+            }
+            FooterLine::View => hint_line(
+                "Display:",
+                &view_hints(picker, scrollable),
+                VIEW_INK,
+                width,
+                picker.wide_ambiguous,
+            ),
+            FooterLine::Memory => {
+                let warning = memory_warning.as_deref().unwrap_or_default();
+                stderr_style().fg(console::Color::Red).apply_to(warning).to_string()
+            }
         });
     }
     for line in &mut lines {
-        clip(line, width);
+        clip(line, width, picker.wide_ambiguous);
     }
     lines
 }
@@ -1236,22 +1471,41 @@ fn swatch_row(
     is_brush: bool,
     editing: Option<&LabelEdit>,
 ) -> String {
-    let Rgb { r, g, b } = swatch.color();
-    let block =
-        stderr_style().bg(console::Color::TrueColor(r, g, b)).apply_to(" ".repeat(SWATCH_WIDTH));
+    let ink = console_color(swatch.color());
+    let block = stderr_style().bg(ink).apply_to(" ".repeat(SWATCH_WIDTH));
     match editing {
         Some(edit) => {
             let caret = stderr_style().reverse().apply_to(' ');
-            let prompt = stderr_style()
-                .fg(console::Color::TrueColor(r, g, b))
-                .bold()
-                .apply_to(RENAME_PROMPT);
+            let prompt = stderr_style().fg(ink).bold().apply_to(RENAME_PROMPT);
             format!("{}{block}{LABEL_GAP}# {}{caret}{prompt}", mark(focused), edit.text)
         }
         None => {
             let tag = if is_brush { BRUSH_TAG } else { "" };
-            format!("{}{block}{LABEL_GAP}# {}{tag}", mark(focused), swatch.label())
+            let slot = slot_tag(swatch.color());
+            format!("{}{block}{LABEL_GAP}# {}{slot}{tag}", mark(focused), swatch.label())
         }
+    }
+}
+
+/// After a slot swatch's label, what it is — so two swatches that look alike but are not the
+/// same colour can be told apart. The first sixteen say they follow the theme, because only those
+/// look different from one terminal to the next. Nothing for a colour of its own.
+fn slot_tag(ink: Ink) -> String {
+    match ink {
+        Ink::Slot(slot) if ink.follows_theme() => {
+            format!("  {}", stderr_style().dim().apply_to(format!("slot {slot} (theme)")))
+        }
+        Ink::Slot(slot) => format!("  {}", stderr_style().dim().apply_to(format!("slot {slot}"))),
+        Ink::Rgb(_) => String::new(),
+    }
+}
+
+/// How `ink` is drawn: a colour of its own as 24-bit colour, a slot as the terminal's own
+/// palette entry — so the picker shows a slot exactly as this terminal shows it.
+fn console_color(ink: Ink) -> console::Color {
+    match ink {
+        Ink::Rgb(Rgb { r, g, b }) => console::Color::TrueColor(r, g, b),
+        Ink::Slot(slot) => console::Color::Color256(slot),
     }
 }
 
@@ -1267,11 +1521,12 @@ fn art_line(
     let marked = matches!(picker.focus, Focus::Cell { y: on, .. } if on == y);
     let cursor = footprint.and_then(|f| f.on_row(y));
     let panes = match picker.split {
-        None => vec![art_cells(row, cursor, window)],
+        None => vec![art_cells(row, cursor, window, CursorLook::Inverted)],
         Some(Split::Stacked) => vec![block_cells(row, cursor, window)],
         Some(Split::SideBySide) => {
             let beside = cursor.clone().filter(|_| picker.art_cursor);
-            vec![block_cells(row, cursor, window.clone()), preview_cells(row, beside, window)]
+            let preview = art_cells(row, beside, window.clone(), CursorLook::Marker);
+            vec![block_cells(row, cursor, window), preview]
         }
     };
     framed(mark(marked), &panes)
@@ -1311,43 +1566,57 @@ fn covers(cursor: &Option<std::ops::Range<usize>>, x: usize) -> bool {
     cursor.as_ref().is_some_and(|xs| xs.contains(&x))
 }
 
+/// How the cells under the cursor are drawn, in a row of art.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorLook {
+    /// Inverted in their own ink — the art view, where the glyph under the cursor is the thing
+    /// being painted and must stay readable.
+    Inverted,
+    /// The canvas's own `+` on a cell filled with the ink — the split view's preview, so the eye
+    /// finds the same spot in both halves.
+    Marker,
+}
+
 /// The cells of a row of art as they will look — glyphs in their colours — with the cells under
-/// the cursor inverted.
+/// the cursor drawn as `look` says.
+///
+/// Drawn in RUNS: every stretch of cells that look alike — the same ink, and all under the cursor
+/// or none of it — is ONE styled span. Styled cell by cell, a painted row sent a full colour
+/// escape per glyph, some twenty bytes where the glyph itself is one, so a frame grew with how
+/// much of the picture was painted rather than with what the eye can tell apart. Measured at
+/// 120×50 over the large sample art while dragging a 6×6 pen: 34 KB a frame cell by cell, 7 KB in
+/// runs — about what the same picture costs unpainted. Each span is still one style applied once,
+/// to glyphs the canvas guarantees are plain text.
 fn art_cells(
     row: &[Cell],
     cursor: Option<std::ops::Range<usize>>,
     window: std::ops::Range<usize>,
+    look: CursorLook,
 ) -> String {
     let mut line = String::new();
-    for (x, cell) in row.iter().enumerate().take(window.end).skip(window.start) {
-        match styled_cell(cell, covers(&cursor, x)) {
-            // The overwhelmingly common case — an uncoloured cell the cursor is not on — costs
-            // one `char` and no allocation, which is what keeps a large canvas cheap to draw.
-            None => line.push(cell.glyph),
-            Some(styled) => line.push_str(&styled),
+    let end = window.end.min(row.len());
+    let mut x = window.start;
+    while x < end {
+        let (ink, under) = (row[x].ink, covers(&cursor, x));
+        let run = row[x..end]
+            .iter()
+            .enumerate()
+            .take_while(|(at, cell)| cell.ink == ink && covers(&cursor, x + at) == under)
+            .count();
+        let glyphs = row[x..x + run].iter().map(|cell| cell.glyph);
+        match (ink, under, look) {
+            // The overwhelmingly common case — unpainted glyphs away from the cursor — costs no
+            // style and no allocation beyond the line itself.
+            (None, false, _) => line.extend(glyphs),
+            (_, true, CursorLook::Marker) => {
+                line.push_str(&block_cursor(ink.unwrap_or(UNINKED), run))
+            }
+            _ => {
+                let glyphs: String = glyphs.collect();
+                line.push_str(&glyph_style(ink, under).apply_to(glyphs).to_string());
+            }
         }
-    }
-    line
-}
-
-/// The cells of a row of the split view's preview: the art as it will look, with the cursor —
-/// unless `c` hid it — drawn the way the canvas draws it, a `+` on a filled cell, so the eye
-/// finds the same spot in both halves.
-fn preview_cells(
-    row: &[Cell],
-    cursor: Option<std::ops::Range<usize>>,
-    window: std::ops::Range<usize>,
-) -> String {
-    let mut line = String::new();
-    for (x, cell) in row.iter().enumerate().take(window.end).skip(window.start) {
-        if covers(&cursor, x) {
-            line.push_str(&block_cursor(cell.ink.unwrap_or(UNINKED)));
-            continue;
-        }
-        match styled_cell(cell, false) {
-            None => line.push(cell.glyph),
-            Some(styled) => line.push_str(&styled),
-        }
+        x += run;
     }
     line
 }
@@ -1368,32 +1637,35 @@ fn block_cells(
     let row = &row[..window.end.min(row.len())];
     let mut x = window.start;
     while x < row.len() {
-        let ink = row[x].ink.unwrap_or(UNINKED);
-        if covers(&cursor, x) {
-            line.push_str(&block_cursor(ink));
-            x += 1;
-            continue;
-        }
+        let (ink, under) = (row[x].ink.unwrap_or(UNINKED), covers(&cursor, x));
         let run = row[x..]
             .iter()
             .enumerate()
-            .take_while(|(at, cell)| cell.ink.unwrap_or(UNINKED) == ink && !covers(&cursor, x + at))
+            .take_while(|(at, cell)| {
+                cell.ink.unwrap_or(UNINKED) == ink && covers(&cursor, x + at) == under
+            })
             .count();
-        let Rgb { r, g, b } = ink;
-        let span = stderr_style().bg(console::Color::TrueColor(r, g, b)).apply_to(" ".repeat(run));
-        line.push_str(&span.to_string());
+        if under {
+            line.push_str(&block_cursor(ink, run));
+        } else {
+            let span = stderr_style().bg(console_color(ink)).apply_to(" ".repeat(run));
+            line.push_str(&span.to_string());
+        }
         x += run;
     }
     line
 }
 
-/// The cursor on a solid block: a marker in whichever of black or white stands out from `ink`.
+/// The cursor on `run` solid blocks of `ink`: a marker in whichever of black or white stands out
+/// from it.
 ///
 /// Not reverse video, which is how the art view marks its cursor: reversing a coloured SPACE
 /// swaps its background into the foreground of a glyph that draws nothing, and on a black cell in
 /// a dark terminal the cursor would vanish outright.
-fn block_cursor(ink: Rgb) -> String {
-    let Rgb { r, g, b } = ink;
+fn block_cursor(ink: Ink, run: usize) -> String {
+    // A slot's brightness by the RGB it usually is — see [`Ink::approximate`]; a guess for the
+    // theme's sixteen, and near enough for choosing black or white.
+    let Rgb { r, g, b } = ink.approximate();
     // Perceived brightness by the Rec. 601 luma weights, on the 0–255 scale the channels use.
     let luma = (299 * r as u32 + 587 * g as u32 + 114 * b as u32) / 1000;
     let mark = match luma > 127 {
@@ -1401,27 +1673,23 @@ fn block_cursor(ink: Rgb) -> String {
         false => console::Color::TrueColor(255, 255, 255),
     };
     stderr_style()
-        .bg(console::Color::TrueColor(r, g, b))
+        .bg(console_color(ink))
         .fg(mark)
         .bold()
-        .apply_to(BLOCK_CURSOR)
+        .apply_to(BLOCK_CURSOR.to_string().repeat(run))
         .to_string()
 }
 
-/// A cell with its ink and the cursor applied, or `None` when it needs neither.
-fn styled_cell(cell: &Cell, focused: bool) -> Option<String> {
-    let ink = cell.ink;
-    if ink.is_none() && !focused {
-        return None;
-    }
+/// How glyphs of art look: in their ink, if they have one, and inverted under the cursor.
+fn glyph_style(ink: Option<Ink>, under_cursor: bool) -> console::Style {
     let mut style = stderr_style();
-    if let Some(Rgb { r, g, b }) = ink {
-        style = style.fg(console::Color::TrueColor(r, g, b));
+    if let Some(ink) = ink {
+        style = style.fg(console_color(ink));
     }
-    if focused {
+    if under_cursor {
         style = style.reverse();
     }
-    Some(style.apply_to(cell.glyph).to_string())
+    style
 }
 
 /// A style destined for stderr, which is where the picker draws.
@@ -1537,19 +1805,44 @@ const FILE_INK: console::Color = console::Color::Yellow;
 const COLOUR_INK: console::Color = console::Color::Green;
 const VIEW_INK: console::Color = console::Color::Cyan;
 
-/// A hint line: every key plain, every action in `ink`, dim dots between. Each piece is one style
-/// applied once, side by side — nothing wraps a rendered string, see the module docs.
-fn hint_line(hints: &[Hint], ink: console::Color) -> String {
+/// The grey of each hint line's title. Fixed rather than the terminal's own "bright black",
+/// which some themes — Solarized's dark one — make the colour of the background itself.
+const TITLE_INK: Rgb = Rgb::new(128, 128, 128);
+
+/// Columns every title is padded to, so each line's keys start in the same column.
+const TITLE_WIDTH: usize = "Display: ".len();
+
+/// A hint line for a terminal `width` columns wide: its `title` in grey, then every key plain,
+/// every action in `ink`, dim dots between. Each piece is one style applied once, side by side —
+/// nothing wraps a rendered string, see the module docs.
+///
+/// THE TITLE GIVES WAY FIRST. When the terminal is too narrow for the title and the line's first
+/// hint whole — on the file line, the way out — the title is left off, rather than letting a
+/// label crowd out the one key that must never be cut.
+fn hint_line(title: &str, hints: &[Hint], ink: console::Color, width: usize, wide: bool) -> String {
+    let Some(&(first_key, first_does)) = hints.first() else { return String::new() };
     let dot = stderr_style().dim().apply_to(" · ").to_string();
     let action = stderr_style().fg(ink);
-    hints
+    let body = hints
         .iter()
         .map(|&(key, does)| match key {
             "" => action.apply_to(does).to_string(),
             key => format!("{key} {}", action.apply_to(does)),
         })
         .collect::<Vec<_>>()
-        .join(&dot)
+        .join(&dot);
+    let first = text_width(first_key, wide)
+        + usize::from(!first_key.is_empty())
+        + text_width(first_does, wide);
+    // A line that goes on past its first hint is clipped with a `…`, which takes room too.
+    let clipped_after = if hints.len() > 1 { char_width('…', wide) } else { 0 };
+    if TITLE_WIDTH + first + clipped_after > width {
+        return body;
+    }
+    let Rgb { r, g, b } = TITLE_INK;
+    let label = stderr_style().fg(console::Color::TrueColor(r, g, b)).apply_to(title);
+    let pad = " ".repeat(TITLE_WIDTH.saturating_sub(text_width(title, wide)));
+    format!("{label}{pad}{body}")
 }
 
 /// The first hint line: the file as a whole. Every key on each hint line does something right
@@ -1558,6 +1851,8 @@ fn hint_line(hints: &[Hint], ink: console::Color) -> String {
 /// HOW TO LEAVE COMES FIRST. A narrow terminal clips the end of a line, and the one hint that must
 /// never be the part cut off is the way out.
 fn file_hints(picker: &Picker) -> Vec<Hint> {
+    // Named the way this terminal can send it: see the redo arm of [`apply`].
+    let redo = if picker.shift_on_ctrl { "shift+^Z" } else { "^Y" };
     match picker.editing.is_some() {
         // Esc gives up the name while one is typed, and everything else waits — but the interrupt.
         true => vec![("^C", "quit")],
@@ -1567,7 +1862,7 @@ fn file_hints(picker: &Picker) -> Vec<Hint> {
                 ("^C", "quit"),
                 ("^S", "save"),
                 ("^Z", "undo"),
-                ("^Y", "redo"),
+                (redo, "redo"),
             ]
         }
     }
@@ -1602,8 +1897,9 @@ fn colour_hints(picker: &Picker) -> Vec<Hint> {
     }
 }
 
-/// The third: what is on screen. Empty while a name is typed, when none of it acts.
-fn view_hints(picker: &Picker) -> Vec<Hint> {
+/// The third: what is on screen. Empty while a name is typed, when none of it acts. Scrolling is
+/// offered only when the picture is `scrollable` — bigger than the window one way or the other.
+fn view_hints(picker: &Picker, scrollable: bool) -> Vec<Hint> {
     if picker.editing.is_some() {
         return Vec::new();
     }
@@ -1615,7 +1911,9 @@ fn view_hints(picker: &Picker) -> Vec<Hint> {
     if picker.split.is_some() {
         hints.push(("c", if picker.art_cursor { "hide art cursor" } else { "show art cursor" }));
     }
-    hints.push(("shift+arrows", "scroll"));
+    if scrollable {
+        hints.push(("shift+arrows", "scroll"));
+    }
     if matches!(picker.focus, Focus::Cell { .. }) {
         hints.push(("pgup/pgdn", "page"));
     }
@@ -1623,25 +1921,93 @@ fn view_hints(picker: &Picker) -> Vec<Hint> {
     hints
 }
 
-/// Trim `line` to `width` display columns in place, marking it when anything was cut.
+/// Columns `c` takes on a terminal that draws East Asian Ambiguous characters `wide`, or not.
+fn char_width(c: char, wide: bool) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    match wide {
+        true => c.width_cjk(),
+        false => c.width(),
+    }
+    .unwrap_or(0)
+}
+
+/// Columns a rendered line takes — its escape sequences none — on a terminal that draws East
+/// Asian Ambiguous characters `wide`, or not.
+fn text_width(text: &str, wide: bool) -> usize {
+    segments(text).filter_map(Result::ok).map(|c| char_width(c, wide)).sum()
+}
+
+/// A rendered line's pieces, in order: `Ok` for each character that reaches the screen, `Err`
+/// for each control sequence — which in a line this module drew is only ever an SGR — whole.
+fn segments(line: &str) -> impl Iterator<Item = Result<char, &str>> {
+    let mut rest = line;
+    std::iter::from_fn(move || {
+        let c = rest.chars().next()?;
+        if c == '\x1b' && rest[1..].starts_with('[') {
+            let end = rest[2..]
+                .find(|c: char| ('\x40'..='\x7e').contains(&c))
+                .map_or(rest.len(), |at| 2 + at + 1);
+            let (escape, after) = rest.split_at(end);
+            rest = after;
+            return Some(Err(escape));
+        }
+        rest = &rest[c.len_utf8()..];
+        Some(Ok(c))
+    })
+}
+
+/// Trim `line` to `width` columns in place, as the terminal will measure them — `wide` when it
+/// draws East Asian Ambiguous characters two columns wide — marking it when anything was cut.
 ///
 /// Clipping by DISPLAY WIDTH rather than by characters or bytes is the whole point: a wrapped
 /// line occupies two physical rows, and then the frame is taller than the painter believes it to
-/// be and the cursor arithmetic drifts.
+/// be and the cursor arithmetic drifts. Measuring the terminal's way is the same point once more:
+/// on a terminal set wide, the `·` between hints is two columns, and a line measured as fitting
+/// by the narrow width wraps all the same.
 ///
 /// Cutting a styled line could leave its colour switched on, and the very next thing
 /// [`crate::paint::frame`] writes is `\x1b[K` — which on most terminals erases using the CURRENT
 /// background. A swatch row clipped mid-colour would then paint itself across the rest of the
-/// screen. `truncate_str` closes any style it cuts through, so nothing is re-armed here; the
-/// guarantee is pinned by `no_rendered_line_leaves_a_style_switched_on` rather than defended by
-/// code, so a change in `console` fails the build instead of leaking colour at runtime.
+/// screen. So a cut that leaves a style on closes it before the `…`; the guarantee is pinned by
+/// `no_rendered_line_leaves_a_style_switched_on`.
 ///
-/// `truncate_str` borrows when it changed nothing, which is what keeps an unclipped frame free of
-/// a round of pointless allocation.
-fn clip(line: &mut String, width: usize) {
-    if let Cow::Owned(cut) = console::truncate_str(line, width, CLIPPED) {
-        *line = cut;
+/// Our own rather than `console::truncate_str`, which it replaced: that measures only the narrow
+/// way. A line that fits is left exactly as it was, with nothing allocated.
+fn clip(line: &mut String, width: usize, wide: bool) {
+    // No room even for the `…` that says something was cut.
+    if width == 0 {
+        line.clear();
+        return;
     }
+    if text_width(line, wide) <= width {
+        return;
+    }
+    let tail = char_width(CLIPPED, wide);
+    let room = width.saturating_sub(tail);
+    let (mut cut, mut used, mut styled) = (String::new(), 0, false);
+    for segment in segments(line) {
+        match segment {
+            Err(escape) => {
+                styled = !matches!(escape, "\x1b[0m" | "\x1b[m");
+                cut.push_str(escape);
+            }
+            Ok(c) => {
+                let takes = char_width(c, wide);
+                if used + takes > room {
+                    break;
+                }
+                cut.push(c);
+                used += takes;
+            }
+        }
+    }
+    if styled {
+        cut.push_str("\x1b[0m");
+    }
+    if tail <= width {
+        cut.push(CLIPPED);
+    }
+    *line = cut;
 }
 
 /// The whole keyboard contract, in one testable place:
@@ -1665,8 +2031,10 @@ fn clip(line: &mut String, width: usize) {
 /// - While a name is being typed, keys type, `Backspace` deletes, `Enter` keeps it, `Esc` gives
 ///   it up. Nothing else acts until one of those.
 /// - `Ctrl+S` asks for a save — asks, because this function touches no file.
-/// - `Ctrl+Z` undoes and `Ctrl+Y` redoes, repeatedly if held. Not `Ctrl+Shift+Z`: a classic
-///   terminal sends the identical byte for it as for `Ctrl+Z`, so the two cannot be told apart.
+/// - `Ctrl+Z` undoes, repeatedly if held. `Ctrl+Shift+Z` redoes where the terminal can tell it
+///   from `Ctrl+Z` — one speaking the kitty keyboard protocol reports the Shift — and `Ctrl+Y`
+///   redoes everywhere, because a classic terminal sends the identical byte for `Ctrl+Shift+Z` as
+///   for `Ctrl+Z`, and there it can only undo.
 /// - `Esc` or `Ctrl+X` closes — unless there is unsaved work, in which case the first press only
 ///   warns and the second discards. `Ctrl+C` interrupts at once regardless, giving up any name
 ///   half-typed and asking the caller to salvage what is unsaved.
@@ -1719,6 +2087,12 @@ pub fn apply(picker: &mut Picker, event: impl Into<KeyEvent>) -> Action {
             KeyCode::Escape if pressed => close_requested(picker, armed),
             KeyCode::Char('x') if pressed && event.is_ctrl('x') => close_requested(picker, armed),
             KeyCode::Char('s') if pressed && event.is_ctrl('s') => Action::Save,
+            // Redo is Ctrl+Shift+Z wherever it can be told from Ctrl+Z — the kitty keyboard
+            // protocol reports the Shift — and Ctrl+Y everywhere, because a classic terminal
+            // sends one byte for both chords and there Ctrl+Shift+Z can only ever undo.
+            KeyCode::Char('z' | 'Z') if event.mods.ctrl && event.mods.shift && !event.mods.alt => {
+                redraw_if(picker.redo())
+            }
             KeyCode::Char('z') if event.is_ctrl('z') => redraw_if(picker.undo()),
             KeyCode::Char('y') if event.is_ctrl('y') => redraw_if(picker.redo()),
             KeyCode::Up if event.mods.shift => scroll_view(picker, -1, 0),
@@ -1975,8 +2349,16 @@ pub fn run_with_devices(
     let mut decoder = crate::keys::Decoder::new();
     let mut queue = Vec::new();
     let protocol = input::KeyboardProtocol::engage(fd, &mut decoder, &mut queue)?;
-    let terminal_releases = protocol.as_ref().is_some_and(|(_, releases)| *releases);
+    let granted = protocol.as_ref().map(|(_, granted)| *granted).unwrap_or_default();
+    let terminal_releases = granted.releases;
+    picker.shift_on_ctrl = granted.shift_on_ctrl;
     let _protocol = protocol.map(|(guard, _)| guard);
+    // Measured, not guessed — see [`input::ambiguous_is_wide`] — and the locale only when the
+    // terminal gave no answer at all.
+    picker.wide_ambiguous = match input::ambiguous_is_wide(fd, &mut decoder, &mut queue)? {
+        Some(wide) => wide,
+        None => input::locale_says_wide(),
+    };
     // Where the terminal will not say when a key comes up, the input devices can — if they are
     // readable. Unused when the terminal already reports releases — never opened, or closed at
     // once if they were handed in: the terminal's answer is focus-correct and needs no permission,
@@ -2173,7 +2555,7 @@ mod tests {
     /// [`footer`], the layout's own definition — rather than by a position that moves whenever the
     /// footer gains a line or the body above it changes shape.
     fn footer_line(lines: &[String], height: usize, which: FooterLine) -> String {
-        let footer = footer(height);
+        let footer = footer(height, false);
         let at = footer.iter().position(|line| *line == which).expect("shown at this height");
         lines[lines.len() - footer.len() + at].clone()
     }
@@ -2198,7 +2580,7 @@ mod tests {
 
     /// The line of a roomy frame of `picker` that shows body line `which`.
     fn line_showing(picker: &Picker, which: BodyLine) -> String {
-        assert!(picker.body_len() <= body_rows(60), "a roomy frame shows the whole body");
+        assert!(picker.body_len() <= body_rows(60, false), "a roomy frame shows the whole body");
         render(picker, 200, 60)[body_index(picker, which)].clone()
     }
 
@@ -2280,7 +2662,12 @@ mod tests {
 
     const TOGGLE: KeyEvent = KeyEvent::press(KeyCode::Char('b'));
 
-    fn inks(picker: &Picker, y: usize) -> Vec<Option<Rgb>> {
+    /// The colour of a swatch these tests gave a colour of its own.
+    fn rgb(ink: Ink) -> Rgb {
+        ink.rgb().expect("a colour of its own")
+    }
+
+    fn inks(picker: &Picker, y: usize) -> Vec<Option<Ink>> {
         picker.canvas().row(y).expect("row").iter().map(|cell| cell.ink).collect()
     }
 
@@ -2371,7 +2758,7 @@ mod tests {
         let ink = Rgb::new(255, 0, 128);
         palette.push("pink", ink).expect("fresh");
         let mut picker = Picker::new(Canvas::from_text("ab").expect("valid")).with_palette(palette);
-        picker.canvas_mut().cell_mut(0, 0).expect("in bounds").ink = Some(ink);
+        picker.canvas_mut().cell_mut(0, 0).expect("in bounds").ink = Some(ink.into());
 
         let row = &line_showing(&at(&picker, Focus::Add), BodyLine::Art(0));
         assert!(row.contains("\x1b[38;2;255;0;128m"), "ink is a FOREGROUND colour: {row:?}");
@@ -2402,7 +2789,7 @@ mod tests {
         with_colour();
         let mut picker = picker(0, "ab");
         press(&mut picker, &[ENTER]); // [+]: added, and handed over for naming
-        let Rgb { r, g, b } = picker.palette().at(0).expect("added").color();
+        let Rgb { r, g, b } = rgb(picker.palette().at(0).expect("added").color());
         let row = &render(&picker, 200, 60)[0];
         assert!(row.contains("# colour 1"), "the current name is the starting text: {row:?}");
         assert!(
@@ -2487,7 +2874,8 @@ mod tests {
     fn no_rendered_line_is_wider_than_the_terminal() {
         with_colour();
         let mut picker = picker(3, "⣿⡇⣿⣿⣿⠛⠁⣴⣿⡿⠿⠧⠹⠿⠘⣿⣿⣿⡇⢸⡻⣿⣿⣿⣿⣿⣿⣿\n⢹⡇⣿⣿⣿⠄⣞⣯⣷⣾⣿⣿⣧⡹⡆⡀⠉⢹⡌⠐⢿⣿⣿⣿⡞⣿⣿⣿");
-        for width in 1..50 {
+        // From zero: a terminal with no columns gets empty lines, not a one-column `…`.
+        for width in 0..50 {
             for focus in [Focus::Swatch { at: 0 }, Focus::Add, Focus::Cell { x: 5, y: 1 }] {
                 for line in render(&at(&picker, focus), width, 20) {
                     let measured = console::measure_text_width(&line);
@@ -2499,7 +2887,7 @@ mod tests {
             }
         }
         picker.begin_rename(0); // the widest row there is: text, caret, prompt
-        for width in 1..50 {
+        for width in 0..50 {
             for line in render(&picker, width, 20) {
                 assert!(
                     console::measure_text_width(&line) <= width,
@@ -2538,7 +2926,7 @@ mod tests {
         let mut view = picker.scrolled(40, 12);
         assert_eq!(view.top, 0);
         // Down to the last row the window shows, and not past it.
-        for _ in 0..body_rows(12) - picker.first_art_line() - 1 {
+        for _ in 0..body_rows(12, false) - picker.first_art_line() - 1 {
             press(&mut picker, &[DOWN]);
             picker.set_view(picker.scrolled(40, 12));
         }
@@ -2551,7 +2939,7 @@ mod tests {
         assert!(view.top > 0, "the cursor went past the bottom, so the window slid");
         assert_eq!(
             picker.cursor_line(),
-            view.top + body_rows(12) - 1,
+            view.top + body_rows(12, false) - 1,
             "just far enough to keep the cursor on the last row shown"
         );
     }
@@ -2610,7 +2998,7 @@ mod tests {
         }
         assert_eq!(
             picker.view().top,
-            picker.body_len() - body_rows(12),
+            picker.body_len() - body_rows(12, false),
             "the last line of the body is the last shown"
         );
     }
@@ -2640,7 +3028,7 @@ mod tests {
         picker.set_view(picker.scrolled(40, 12));
         press(&mut picker, &[TOGGLE, release(KeyCode::Char('b'))]); // pen down at the top
         press(&mut picker, &[KeyEvent::press(KeyCode::PageDown)]);
-        let page = body_rows(12);
+        let page = body_rows(12, false);
         assert_eq!(picker.focus(), Focus::Cell { x: 0, y: page }, "a window's height down");
         assert!((1..page).all(|y| inks(&picker, y)[0].is_none()), "a jump, not a stroke");
         press(&mut picker, &[KeyEvent::press(KeyCode::PageUp)]);
@@ -2662,14 +3050,18 @@ mod tests {
             let lines = render(&picker, 300, height);
             let file = footer_line(&lines, height, FooterLine::File);
             assert!(file.contains("esc"), "height {height} lost the way out: {file:?}");
-            let body = lines.len() - footer(height).len();
-            if footer(height).len() > 2 {
+            let body = lines.len() - footer(height, false).len();
+            if footer(height, false).len() > 2 {
                 assert!(body >= MIN_BODY_ROWS, "height {height}: extra hints ate the picture");
             }
         }
-        assert_eq!(footer(1), [FooterLine::File], "one row: only the way out");
-        assert_eq!(footer(2), [FooterLine::Status, FooterLine::File], "then what the pen is doing");
-        assert_eq!(footer(40).len(), 4, "and with room, everything");
+        assert_eq!(footer(1, false), [FooterLine::File], "one row: only the way out");
+        assert_eq!(
+            footer(2, false),
+            [FooterLine::Status, FooterLine::File],
+            "then what the pen is doing"
+        );
+        assert_eq!(footer(40, false).len(), 4, "and with room, everything");
     }
 
     /// …and however NARROW. The end of a hint line is what gets clipped, so the way out leads it.
@@ -2681,6 +3073,62 @@ mod tests {
             let file = footer_line(&render(&picker, width, 12), 12, FooterLine::File);
             assert!(file.contains("esc"), "width {width} lost the way out: {file:?}");
         }
+    }
+
+    /// Each hint line leads with its title, in grey, padded so the keys of every line start in
+    /// the same column.
+    #[test]
+    fn every_hint_line_has_a_grey_title_and_the_keys_line_up() {
+        with_colour();
+        let lines = roomy(&ready_to_paint("ab"), Focus::Cell { x: 0, y: 0 });
+        let Rgb { r, g, b } = TITLE_INK;
+        let grey = format!("\x1b[38;2;{r};{g};{b}m");
+        for (which, title) in [
+            (FooterLine::File, "Program:"),
+            (FooterLine::Colour, "Draw:"),
+            (FooterLine::View, "Display:"),
+        ] {
+            let line = footer_line(&lines, 60, which);
+            assert!(line.starts_with(&format!("{grey}{title}")), "{which:?}: {line:?}");
+            let plain = console::strip_ansi_codes(&line).into_owned();
+            let keys_start = plain.find(|c: char| c != ' ' && !title.contains(c)).expect("keys");
+            assert_eq!(keys_start, TITLE_WIDTH, "{which:?} keys start after the title: {plain:?}");
+        }
+    }
+
+    /// On a terminal too narrow for a title and the way out both, the title gives way — the way
+    /// out is never the part a label crowds off.
+    #[test]
+    fn a_title_gives_way_before_the_way_out_does() {
+        with_colour();
+        let picker = ready_to_paint("ab");
+        let file = |width| {
+            let lines = render(&picker, width, 12);
+            console::strip_ansi_codes(&footer_line(&lines, 12, FooterLine::File)).into_owned()
+        };
+        assert!(file(18).starts_with("^X/esc close"), "narrow: {:?}", file(18));
+        assert!(file(80).starts_with("Program: ^X/esc close"), "wide: {:?}", file(80));
+        for width in 16..80 {
+            assert!(file(width).contains("^X/esc close"), "width {width}: {:?}", file(width));
+        }
+    }
+
+    /// Scrolling is offered only when there is somewhere to scroll to: a picture that fits the
+    /// terminal both ways gets no `shift+arrows` hint, and one that does not, either way, does.
+    #[test]
+    fn the_scroll_hint_shows_only_when_the_picture_does_not_fit() {
+        with_colour();
+        let view = |p: &Picker, width, height| {
+            let lines = render(p, width, height);
+            console::strip_ansi_codes(&footer_line(&lines, height, FooterLine::View)).into_owned()
+        };
+        let small = ready_to_paint("abc\ndef");
+        assert!(!view(&small, 80, 30).contains("shift+arrows"), "{}", view(&small, 80, 30));
+        let tall = ready_to_paint(&["abc"; 40].join("\n"));
+        assert!(view(&tall, 80, 30).contains("shift+arrows scroll"), "taller than the window");
+        let wide = ready_to_paint(&"x".repeat(120));
+        assert!(view(&wide, 80, 30).contains("shift+arrows scroll"), "wider than the window");
+        assert!(view(&small, 80, 30).contains("pgup/pgdn page"), "paging still jumps");
     }
 
     /// Each hint line colours its actions in its own colour and leaves the keys plain, so "space
@@ -2890,7 +3338,7 @@ mod tests {
     #[test]
     fn a_clipped_line_says_it_was_clipped() {
         let mut line = String::from("abcdefghij");
-        clip(&mut line, 5);
+        clip(&mut line, 5, false);
         assert!(line.contains(CLIPPED), "{line:?}");
         assert_eq!(console::measure_text_width(&line), 5);
     }
@@ -2899,8 +3347,195 @@ mod tests {
     fn a_line_that_fits_is_left_exactly_as_it_was() {
         let original = "\x1b[48;2;1;2;3m   \x1b[0m short";
         let mut line = String::from(original);
-        clip(&mut line, 80);
+        clip(&mut line, 80, false);
         assert_eq!(line, original, "nothing was cut, so nothing changed");
+    }
+
+    /// On a terminal that draws East Asian Ambiguous characters wide, a line is measured and cut
+    /// the way it will be drawn there: two columns for `·`, `—` and `…` alike.
+    #[test]
+    fn a_wide_terminal_is_measured_and_clipped_its_own_way() {
+        assert_eq!((text_width("a·b", false), text_width("a·b", true)), (3, 4));
+        assert_eq!(text_width("\x1b[2m·\x1b[0m", true), 2, "escapes take no room");
+        let mut line = format!("{}a · b · c · d", stderr_style().dim().apply_to("x"));
+        clip(&mut line, 7, true);
+        assert!(text_width(&line, true) <= 7, "{line:?}");
+        assert!(line.ends_with(CLIPPED), "{line:?}");
+        assert!(!leaves_a_style_open(&line), "{line:?}");
+        // A two-column character that would not fit is left out whole, so a cut can fall a
+        // column short of the width rather than run a column over it.
+        let mut narrow = String::from("a·b·c·d");
+        clip(&mut narrow, 7, true);
+        assert_eq!(narrow, "a·b…", "its `…` two columns, and the `·` after `b` left out whole");
+        assert_eq!(text_width(&narrow, true), 6);
+    }
+
+    /// Every frame fits a terminal that draws ambiguous characters wide, however narrow — the
+    /// same sweep as for the narrow measure, measured the wide way.
+    #[test]
+    fn no_rendered_line_is_wider_than_a_wide_terminal_draws_it() {
+        with_colour();
+        let mut picker = picker(3, "a\u{2588}b\u{2591}c\nd\u{b7}e\u{2014}f");
+        picker.set_wide_ambiguous(true);
+        picker.notice = Some("a notice with a dash — and dots ·…".into());
+        for width in 0..60 {
+            for focus in [Focus::Swatch { at: 0 }, Focus::Add, Focus::Cell { x: 1, y: 0 }] {
+                for line in render(&at(&picker, focus), width, 30) {
+                    let measured = text_width(&line, true);
+                    assert!(measured <= width, "{measured} columns at {width}: {line:?}");
+                    assert!(!leaves_a_style_open(&line), "{line:?}");
+                }
+            }
+        }
+    }
+
+    // ---- a corpus of random sessions ----------------------------------------------------------
+
+    /// A small, fixed, seedable generator — the corpus below must not change when anything else's
+    /// randomness does.
+    struct Corpus(u64);
+
+    impl Corpus {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Keys a person or a terminal can send, in the spellings terminals really use — replies,
+    /// mouse reports, pastes, torn and runaway sequences and invalid bytes included.
+    const CORPUS_KEYS: &[&[u8]] = &[
+        b"\x1b[A",
+        b"\x1b[B",
+        b"\x1b[C",
+        b"\x1b[D",
+        b"\x1b[1;2A",
+        b"\x1b[1;2B",
+        b"\x1b[1;2C",
+        b"\x1b[1;2D",
+        b"\x1b[5~",
+        b"\x1b[6~",
+        b" ",
+        b"\r",
+        b"\x7f",
+        b"\x1b[3~",
+        b"b",
+        b"i",
+        b"[",
+        b"]",
+        b"c",
+        b"x",
+        b"B",
+        b"\t",
+        b"\x1b[Z",
+        b"\x1b[15~",
+        b"\x1b[17~",
+        b"\x1b[17;2~",
+        b"\x1bOQ",
+        b"\x1a",
+        b"\x19",
+        b"\x13",
+        b"\x18",
+        b"\x03",
+        b"\x1b[32u",
+        b"\x1b[32;1:2u",
+        b"\x1b[32;1:3u",
+        b"\x1b[127u",
+        b"\x1b[127;1:3u",
+        b"\x1b[13u",
+        b"\x1b[13;1:3u",
+        b"\x1b[3;1:3~",
+        b"\x1b[122;6u",
+        b"\x1b[57441u",
+        b"\x1b[<0;5;5M",
+        b"\x1b]0;t\x07",
+        b"\x1b[?62;22c",
+        b"\x1b[?27u",
+        b"\x1b",
+        b"\x1b[",
+        b"\x1b[99999999999999999999A",
+        b"\x00",
+        b"\xff",
+        "\u{e9}".as_bytes(),
+        "\u{6f22}".as_bytes(),
+        b"\x1b[200~p\x1b[201~",
+    ];
+
+    /// A fixed corpus of random sessions — random art, palettes, key streams and terminal sizes,
+    /// from zero columns and rows up — with every frame checked against the promises a frame
+    /// makes: never taller or wider than the terminal, never a line left with a style on, and,
+    /// while the window follows it, the cursor on screen.
+    ///
+    /// A CORPUS, NOT A FUZZER. The same seeds give the same inputs only while this generator and
+    /// these tables stay as they are, so a green run is a guarantee about these cases and no
+    /// others. When it finds something, check the failing input in as a test of its own, rather
+    /// than trusting the seed to reproduce it after the next change here.
+    #[test]
+    fn a_corpus_of_random_sessions_keeps_every_promise_a_frame_makes() {
+        with_colour();
+        const GLYPHS: &[char] = &['.', '#', ' ', 'a', '\u{28ff}', '\u{2588}', '|', '\u{e9}'];
+        for seed in 1..=40u64 {
+            let mut rng = Corpus(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let (rows, cols) = (1 + rng.below(30), 1 + rng.below(70));
+            let art: Vec<String> = (0..rows)
+                .map(|_| {
+                    (0..1 + rng.below(cols)).map(|_| GLYPHS[rng.below(GLYPHS.len())]).collect()
+                })
+                .collect();
+            let mut palette = Palette::new();
+            for n in 0..rng.below(5) {
+                // Colours of their own and terminal palette slots alike, as a file can hold.
+                let color = match rng.below(3) {
+                    0 => Ink::Slot(rng.below(256) as u8),
+                    _ => Rgb::new(rng.below(256) as u8, rng.below(256) as u8, n as u8 * 40).into(),
+                };
+                let _ = palette.push(format!("colour {n}"), color);
+            }
+            let canvas = Canvas::from_text(&art.join("\n")).expect("the glyphs are all valid");
+            let mut picker =
+                Picker::new(canvas).with_palette(palette).with_rng(Rng::from_seed(seed));
+            picker.set_hold_keys(rng.below(2) == 0);
+            picker.set_shift_on_ctrl(rng.below(2) == 0);
+            let wide = rng.below(2) == 0;
+            picker.set_wide_ambiguous(wide);
+            // Half the sessions over the memory line, so the red line is swept with the rest.
+            let warns = rng.below(2) == 0;
+            picker.set_memory_warning_above(if warns { 0 } else { usize::MAX });
+            let mut decoder = crate::keys::Decoder::new();
+            for step in 0..80 {
+                let mut decoded = decoder.feed(CORPUS_KEYS[rng.below(CORPUS_KEYS.len())]);
+                if rng.below(3) == 0 {
+                    decoded.extend(decoder.flush());
+                }
+                for key in decoded.into_iter().filter_map(|d| match d {
+                    crate::keys::Decoded::Key(key) => Some(key),
+                    _ => None,
+                }) {
+                    apply(&mut picker, key);
+                }
+                let (width, height) = (rng.below(120), rng.below(60));
+                picker.set_view(picker.scrolled(width, height));
+                let lines = render(&picker, width, height);
+                let at = format!("seed {seed}, step {step}, {width}x{height}");
+                assert!(lines.len() <= height, "{at}: {} lines", lines.len());
+                for line in &lines {
+                    let measured = text_width(line, wide);
+                    assert!(measured <= width, "{at}: {measured} columns: {line:?}");
+                    assert!(!leaves_a_style_open(line), "{at}: a style left on: {line:?}");
+                }
+                // The mark survives a cut only with room for it and the `…` both.
+                let mark_room = GUTTER + char_width(CLIPPED, wide);
+                if picker.view().follow && body_rows(height, warns) > 0 && width >= mark_room {
+                    assert_eq!(marked(&lines).len(), 1, "{at}: the cursor is on screen");
+                }
+            }
+        }
     }
 
     // ---- what keys do -----------------------------------------------------------------------
@@ -3383,6 +4018,27 @@ mod tests {
         assert!(inks(&picker, 0).iter().all(Option::is_none), "three strokes, three undos");
     }
 
+    /// Redo is Ctrl+Shift+Z where the terminal reports the Shift — here in the kitty protocol's
+    /// own bytes — and Ctrl+Y wherever it does not; a classic terminal's Ctrl+Shift+Z is the very
+    /// byte Ctrl+Z sends, so there it can only undo. The hint names whichever this terminal has.
+    #[test]
+    fn ctrl_shift_z_redoes_where_the_terminal_can_tell_it_from_ctrl_z() {
+        let mut picker = ready_to_paint("abc");
+        press(&mut picker, &[SPACE]);
+        let painted = inks(&picker, 0);
+        press(&mut picker, &[UNDO]);
+        assert_eq!(type_bytes(&mut picker, b"\x1b[122;6u"), Action::Redraw, "kitty's ctrl+shift+z");
+        assert_eq!(inks(&picker, 0), painted, "redone");
+        type_bytes(&mut picker, b"\x1a");
+        assert!(inks(&picker, 0).iter().all(Option::is_none), "the classic byte is ctrl+z: undo");
+        assert_eq!(type_bytes(&mut picker, b"\x19"), Action::Redraw, "ctrl+y still redoes");
+        assert_eq!(inks(&picker, 0), painted);
+
+        assert!(hints(&picker).contains("^Y redo"), "{}", hints(&picker));
+        picker.set_shift_on_ctrl(true);
+        assert!(hints(&picker).contains("shift+^Z redo"), "{}", hints(&picker));
+    }
+
     /// Typing reads what a key TYPED, not which key it was: Shift+A under the protocol is the key
     /// `a` with the text `A`. A chord or a release types nothing.
     #[test]
@@ -3639,6 +4295,21 @@ mod tests {
         }
     }
 
+    /// A painted stretch is drawn as ONE styled span, whatever its length — the reason a heavily
+    /// painted picture costs about what a plain one does to redraw.
+    #[test]
+    fn a_painted_run_is_one_span_however_long() {
+        with_colour();
+        let mut picker = ready_to_paint(&["abcdefghij"; 2].join("\n"));
+        press(&mut picker, &[TOGGLE]);
+        press(&mut picker, &[RIGHT; 9]);
+        press(&mut picker, &[TOGGLE, DOWN]); // painted all of row 0; the cursor is on row 1
+        let Rgb { r, g, b } = rgb(picker.palette().at(0).unwrap().color());
+        let row = line_showing(&picker, BodyLine::Art(0));
+        assert_eq!(row.matches(&format!("\x1b[38;2;{r};{g};{b}m")).count(), 1, "{row:?}");
+        assert!(console::strip_ansi_codes(&row).contains("abcdefghij"), "every glyph: {row:?}");
+    }
+
     /// The pen's footprint is what the cursor looks like: every cell it will touch is marked, in
     /// the art and on the split canvas alike, and the gutter mark stays on the cursor's own row.
     #[test]
@@ -3647,8 +4318,17 @@ mod tests {
         let mut picker = ready_to_paint(&["abcde"; 4].join("\n"));
         picker.set_focus(Focus::Cell { x: 2, y: 1 });
         grow(&mut picker, 2);
-        let inverted = |p: &Picker, y| line_showing(p, BodyLine::Art(y)).matches("\x1b[7m").count();
-        assert_eq!((0..4).map(|y| inverted(&picker, y)).collect::<Vec<_>>(), [3, 3, 3, 0]);
+        // One inverted span per row, covering exactly the three glyphs the pen will touch.
+        let span = glyph_style(None, true).apply_to("bcd").to_string();
+        let row = |y| line_showing(&picker, BodyLine::Art(y));
+        assert_eq!(
+            (0..4).map(|y| row(y).contains(&span)).collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+        assert_eq!(
+            (0..4).map(|y| row(y).matches("\x1b[7m").count()).collect::<Vec<_>>(),
+            [1, 1, 1, 0]
+        );
         assert_eq!(marked(&render(&picker, 200, 60)), [body_index(&picker, BodyLine::Art(1))]);
         let split = split(&picker);
         let row = line_showing(&split, BodyLine::Art(0));
@@ -3664,7 +4344,7 @@ mod tests {
         palette.push("red", RED).expect("fresh");
         palette.push("blue", BLUE).expect("fresh");
         let mut picker = Picker::new(Canvas::from_text("ab").expect("valid")).with_palette(palette);
-        picker.canvas_mut().cell_mut(0, 0).expect("in bounds").ink = Some(BLUE);
+        picker.canvas_mut().cell_mut(0, 0).expect("in bounds").ink = Some(BLUE.into());
         picker.set_focus(Focus::Swatch { at: 0 });
         press(&mut picker, &[ENTER]);
         assert_eq!(picker.brush(), Some("red"));
@@ -3692,6 +4372,219 @@ mod tests {
         press(&mut picker, &[ch('i'), ch('['), ch(']'), ch('c')]);
         assert_eq!(picker.editing(), Some("colour 1i[]c"));
         assert_eq!(picker.pen_size(), 1);
+    }
+
+    // ---- terminal palette slots, beside colours of their own ------------------------------
+
+    /// A picker over one row of art, with a slot swatch — the terminal's slot `slot` — as its
+    /// brush and the cursor on the first cell.
+    fn slotted(slot: u8) -> Picker {
+        let mut palette = Palette::new();
+        palette.push("sea", Ink::Slot(slot)).expect("fresh");
+        palette.push("ember", RED).expect("fresh");
+        let mut picker = Picker::new(Canvas::from_text("abc").unwrap()).with_palette(palette);
+        picker.set_focus(Focus::Swatch { at: 0 });
+        press(&mut picker, &[ENTER]);
+        picker.set_focus(Focus::Cell { x: 0, y: 0 });
+        picker
+    }
+
+    /// A slot swatch is drawn through the terminal's own palette — so it looks exactly as this
+    /// terminal shows that slot — and says what it is after its label; the sixteen that follow
+    /// the theme say that too. A colour of its own says nothing.
+    #[test]
+    fn a_slot_swatch_draws_as_the_terminals_slot_and_says_so() {
+        with_colour();
+        let picker = slotted(196);
+        let row = line_showing(&picker, BodyLine::Swatch(0));
+        assert!(row.contains("\x1b[48;5;196m"), "the terminal's own slot 196: {row:?}");
+        assert!(console::strip_ansi_codes(&row).contains("# sea  slot 196"), "{row:?}");
+        assert!(!line_showing(&picker, BodyLine::Swatch(1)).contains("slot"), "ember is its own");
+        let themed = line_showing(&slotted(3), BodyLine::Swatch(0));
+        assert!(console::strip_ansi_codes(&themed).contains("slot 3 (theme)"), "{themed:?}");
+    }
+
+    /// Painting with a slot inks the cells with the slot itself, drawn as the terminal's slot;
+    /// `i` picks the slot swatch back up from them.
+    #[test]
+    fn a_slot_paints_as_itself_and_is_picked_back_up() {
+        with_colour();
+        let mut picker = slotted(196);
+        press(&mut picker, &[SPACE]);
+        assert_eq!(inks(&picker, 0)[0], Some(Ink::Slot(196)));
+        assert!(line_showing(&picker, BodyLine::Art(0)).contains("\x1b[38;5;196m"));
+
+        picker.set_focus(Focus::Swatch { at: 1 });
+        press(&mut picker, &[ENTER]);
+        assert_eq!(picker.brush(), Some("ember"));
+        picker.set_focus(Focus::Cell { x: 0, y: 0 });
+        press(&mut picker, &[ch('i')]);
+        assert_eq!(picker.brush(), Some("sea"), "the slot swatch, from the cell");
+    }
+
+    /// F2's re-roll is always a colour of its own, so on a slot swatch it makes a regular one —
+    /// and says so, since the swatch stops following the terminal. Undo makes it the slot again.
+    #[test]
+    fn f2_on_a_slot_swatch_makes_it_a_colour_of_its_own_and_says_so() {
+        let mut picker = slotted(196);
+        picker.set_focus(Focus::Swatch { at: 0 });
+        press(&mut picker, &[F2, ESC]);
+        let now = picker.palette().get("sea").unwrap().color();
+        assert!(matches!(now, Ink::Rgb(_)), "{now:?}");
+        press(&mut picker, &[UNDO]);
+        assert_eq!(picker.palette().get("sea").unwrap().color(), Ink::Slot(196));
+    }
+
+    /// The notice F2 leaves on a slot swatch, said while the name is still being typed.
+    #[test]
+    fn the_re_roll_of_a_slot_swatch_is_announced() {
+        let mut picker = slotted(21);
+        picker.set_focus(Focus::Swatch { at: 0 });
+        press(&mut picker, &[F2]);
+        let notice = picker.notice().expect("a notice");
+        assert!(notice.contains("no longer the terminal's slot 21"), "{notice}");
+    }
+
+    /// `[+]` only ever adds a colour of its own: a slot's look is the terminal's, and nothing a
+    /// person did not ask for should come to depend on it.
+    #[test]
+    fn the_button_adds_colours_of_their_own_only() {
+        let mut picker = picker(0, "ab");
+        for _ in 0..20 {
+            picker.set_focus(Focus::Add);
+            press(&mut picker, &[ENTER, ENTER]);
+        }
+        assert!(picker.palette().iter().all(|swatch| matches!(swatch.color(), Ink::Rgb(_))));
+    }
+
+    /// On a slot the block cursor chooses black or white by the colour the slot usually is.
+    #[test]
+    fn the_block_cursor_reads_a_slot_by_its_usual_colour() {
+        with_colour();
+        let on_white_slot = block_cursor(Ink::Slot(231), 1);
+        assert!(on_white_slot.contains("\x1b[38;2;0;0;0m"), "black on slot 231: {on_white_slot:?}");
+        assert!(on_white_slot.contains("\x1b[48;5;231m"), "on the slot itself: {on_white_slot:?}");
+    }
+
+    // ---- memory -----------------------------------------------------------------------------
+
+    /// The history's running totals, recounted from nothing: what [`History::bytes`] adds up
+    /// without walking the history must be exactly what walking it finds.
+    fn recounted(history: &History) -> (usize, usize) {
+        let heap = |list: &[Edit]| list.iter().map(Edit::heap_bytes).sum::<usize>();
+        (heap(&history.done), heap(&history.undone))
+    }
+
+    /// Whatever the history goes through — strokes folded, undone, redone, a rename rewriting the
+    /// labels it holds, a new edit throwing the redo list away — its running totals stay exactly
+    /// what a recount finds.
+    #[test]
+    fn the_historys_memory_is_kept_count_of_through_everything() {
+        let mut picker = ready_to_paint(&["abcdef"; 6].join("\n"));
+        let check = |p: &Picker, when: &str| {
+            let history = &p.history;
+            assert_eq!((history.done_heap, history.undone_heap), recounted(history), "{when}");
+        };
+        grow(&mut picker, 2);
+        press(&mut picker, &[TOGGLE, RIGHT, DOWN, RIGHT, TOGGLE]);
+        check(&picker, "after a stroke");
+        picker.set_focus(Focus::Add);
+        press(&mut picker, &[ENTER, ch('x'), ENTER]);
+        check(&picker, "after adding and naming a swatch");
+        assert!(picker.undo() && picker.undo(), "the rename and the add");
+        check(&picker, "after two undos");
+        assert!(picker.redo());
+        check(&picker, "after a redo");
+        // The swatch `[+]` added: its AddSwatch is in the history, so renaming it rewrites a label
+        // the history holds, and the label's length changes with it.
+        assert!(picker.begin_rename(1));
+        press(&mut picker, &[ch('y'), ch('y'), ENTER]);
+        assert!(picker
+            .history
+            .done
+            .iter()
+            .any(|edit| matches!(edit, Edit::AddSwatch { label, .. } if label == "colour 2yy")));
+        check(&picker, "after a rename rewrote the labels the history holds");
+        picker.set_focus(Focus::Cell { x: 0, y: 0 });
+        press(&mut picker, &[SPACE]);
+        check(&picker, "after a new edit threw the redo list away");
+        assert_eq!(picker.history.undone_heap, 0);
+    }
+
+    /// A long stroke grows the list of edits to hold every cell it touches; folding them into one
+    /// entry gives that room back, so it is neither paid for twice nor counted as history.
+    #[test]
+    fn a_folded_stroke_gives_back_the_room_it_grew() {
+        let mut picker = ready_to_paint(&["abcdefghij"; 10].join("\n"));
+        picker.set_focus(Focus::Cell { x: 4, y: 4 });
+        grow(&mut picker, 9);
+        press(&mut picker, &[SPACE]);
+        let done = &picker.history.done;
+        assert_eq!(done.len(), 1, "one stroke");
+        assert!(
+            done.capacity() <= 2 * done.len() + 64,
+            "and no empty room kept: {}",
+            done.capacity()
+        );
+    }
+
+    /// Memory is reported in two parts — the image and its history — each as allocated.
+    #[test]
+    fn memory_is_reported_as_the_image_and_its_history() {
+        let mut picker = ready_to_paint(&["abcdefghij"; 10].join("\n"));
+        let before = picker.memory();
+        assert_eq!(before.image, 10 * 10 * std::mem::size_of::<Cell>(), "a cell for each");
+        assert_eq!(before.total(), before.image + before.history);
+        picker.set_focus(Focus::Cell { x: 4, y: 4 });
+        grow(&mut picker, 9);
+        press(&mut picker, &[SPACE]);
+        let after = picker.memory();
+        assert_eq!(after.image, before.image, "painting does not grow the image");
+        assert!(after.history >= before.history + 100 * std::mem::size_of::<Edit>(), "{after:?}");
+    }
+
+    /// Past the line, a red line at the very bottom — under all three hint lines — says how much
+    /// memory there is, and how much of it is the image and how much the undo history.
+    #[test]
+    fn past_the_memory_line_a_red_line_under_the_hints_says_where_it_goes() {
+        with_colour();
+        let mut picker = ready_to_paint("abc");
+        assert!(!render(&picker, 200, 60).iter().any(|l| l.contains("undo history")), "not yet");
+        picker.set_memory_warning_above(0);
+        let lines = render(&picker, 200, 60);
+        let last = lines.last().expect("a footer");
+        let memory = picker.memory();
+        let red = stderr_style().fg(console::Color::Red).apply_to("x").to_string();
+        assert!(last.starts_with(&red[..red.find('x').unwrap()]), "red: {last:?}");
+        for part in [
+            format!("memory {}", readable_bytes(memory.total())),
+            format!("the image {}", readable_bytes(memory.image)),
+            format!("the undo history {}", readable_bytes(memory.history)),
+        ] {
+            assert!(last.contains(&part), "{part:?} in {last:?}");
+        }
+        assert!(lines[lines.len() - 2].contains("redraw"), "under the display line: {lines:?}");
+    }
+
+    /// The warning is news, not help: short of room, the hint lines give way before it does —
+    /// and it gives way only to the way out and the status.
+    #[test]
+    fn the_memory_warning_gives_way_only_to_the_way_out_and_the_status() {
+        use FooterLine::{Colour, File, Memory, Status, View};
+        assert_eq!(footer(1, true), [File]);
+        assert_eq!(footer(2, true), [Status, File]);
+        assert_eq!(footer(3, true), [Status, File, Memory]);
+        assert_eq!(footer(7, true), [Status, File, Colour, Memory]);
+        assert_eq!(footer(8, true), [Status, File, Colour, View, Memory]);
+        assert_eq!(footer(40, false), [Status, File, Colour, View], "and without one, as ever");
+    }
+
+    #[test]
+    fn bytes_read_the_way_a_person_says_them() {
+        assert_eq!(readable_bytes(512), "512 bytes");
+        assert_eq!(readable_bytes(480_000), "480.0 KB");
+        assert_eq!(readable_bytes(648_000_000), "648.0 MB");
+        assert_eq!(readable_bytes(2_600_000_000), "2.6 GB");
     }
 
     // ---- F5, and the split view -------------------------------------------------------------
@@ -3807,7 +4700,7 @@ mod tests {
                 Split::Stacked => line_showing(p, BodyLine::Preview(0)),
                 Split::SideBySide => line_showing(p, BodyLine::Art(0)),
             };
-            let marker = block_cursor(UNINKED);
+            let marker = block_cursor(UNINKED, 1);
             let expected = if layout == Split::Stacked { 1 } else { 2 };
             assert_eq!(preview(&picker).matches(&marker).count(), expected, "{layout:?} shown");
             assert!(preview(&picker).contains(&format!("{marker}b")), "{layout:?}: on the `a`");
@@ -3827,7 +4720,7 @@ mod tests {
     fn on_the_block_canvas_an_uninked_cell_is_black_and_an_inked_one_its_colour() {
         with_colour();
         let mut picker = ready_to_paint("abc");
-        let Rgb { r, g, b } = picker.palette().at(0).unwrap().color();
+        let Rgb { r, g, b } = rgb(picker.palette().at(0).unwrap().color());
         press(&mut picker, &[SPACE, release(KeyCode::Char(' '))]);
         picker.set_focus(Focus::Add); // cursor off the canvas, so no marker in the way
         let row = &line_showing(&split(&picker), BodyLine::Art(0));
@@ -3854,11 +4747,11 @@ mod tests {
         let picker = ready_to_paint("ab");
         // Checked as a set, not a sequence: `console` writes the foreground before the
         // background whatever order the style was built in, and that order is its business.
-        let on_black = block_cursor(Rgb::new(0, 0, 0));
+        let on_black = block_cursor(Rgb::new(0, 0, 0).into(), 1);
         assert!(on_black.contains("\x1b[48;2;0;0;0m"), "on its cell's black: {on_black:?}");
         assert!(on_black.contains("\x1b[38;2;255;255;255m"), "in white: {on_black:?}");
         assert!(on_black.contains(BLOCK_CURSOR));
-        let on_light = block_cursor(Rgb::new(250, 250, 200));
+        let on_light = block_cursor(Rgb::new(250, 250, 200).into(), 1);
         assert!(on_light.contains("\x1b[38;2;0;0;0m"), "black on a light cell: {on_light:?}");
         let row = &line_showing(&split(&picker), BodyLine::Art(0));
         assert!(row.contains(&on_black), "and that is what the canvas row draws: {row:?}");
@@ -3871,7 +4764,7 @@ mod tests {
         let mut picker = ready_to_paint("ab");
         picker.split = Some(Split::Stacked);
         press(&mut picker, &[SPACE, release(KeyCode::Char(' '))]);
-        let Rgb { r, g, b } = picker.palette().at(0).unwrap().color();
+        let Rgb { r, g, b } = rgb(picker.palette().at(0).unwrap().color());
         picker.set_focus(Focus::Add);
         let canvas = line_showing(&picker, BodyLine::Art(0));
         let preview = line_showing(&picker, BodyLine::Preview(0));
@@ -4182,13 +5075,13 @@ mod tests {
         palette.push("sky", BLUE).expect("distinct");
         let mut picker =
             Picker::new(Canvas::from_text("abc").expect("valid")).with_palette(palette);
-        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED);
-        picker.canvas_mut().cell_mut(1, 0).unwrap().ink = Some(BLUE);
+        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED.into());
+        picker.canvas_mut().cell_mut(1, 0).unwrap().ink = Some(BLUE.into());
         // Cell 2 stays uninked, so "rewrite the matching cells" must not mean "rewrite all".
 
-        let moved = Rgb::new(20, 200, 40);
+        let moved: Ink = Rgb::new(20, 200, 40).into();
         picker.set_swatch_color("ember", moved).expect("that colour is free");
-        assert_eq!(inks(&picker, 0), [Some(moved), Some(BLUE), None]);
+        assert_eq!(inks(&picker, 0), [Some(moved), Some(BLUE.into()), None]);
     }
 
     /// Cells belonging to a FOLLOWER move too, without the caller naming it — which is the whole
@@ -4203,10 +5096,10 @@ mod tests {
         let shade = palette.get("shade").expect("just pushed").color();
 
         let mut picker = Picker::new(Canvas::from_text("ab").expect("valid")).with_palette(palette);
-        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED);
+        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED.into());
         picker.canvas_mut().cell_mut(1, 0).unwrap().ink = Some(shade);
 
-        let moved = Rgb::new(20, 200, 40);
+        let moved: Ink = Rgb::new(20, 200, 40).into();
         picker.set_swatch_color("base", moved).expect("free");
 
         let now_shade = picker.palette().get("shade").expect("still here").color();
@@ -4222,13 +5115,13 @@ mod tests {
         palette.push("ember", RED).expect("fresh");
         palette.push("sky", BLUE).expect("distinct");
         let mut picker = Picker::new(Canvas::from_text("ab").expect("valid")).with_palette(palette);
-        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED);
-        picker.canvas_mut().cell_mut(1, 0).unwrap().ink = Some(BLUE);
+        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED.into());
+        picker.canvas_mut().cell_mut(1, 0).unwrap().ink = Some(BLUE.into());
         let before = picker.canvas().clone();
 
         assert!(picker.set_swatch_color("ember", BLUE).is_err(), "sky is taken");
         assert_eq!(picker.canvas(), &before, "not one pixel moved");
-        assert_eq!(picker.palette().get("ember").unwrap().color(), RED, "nor the swatch");
+        assert_eq!(picker.palette().get("ember").unwrap().color(), RED.into(), "nor the swatch");
     }
 
     /// The interaction that would otherwise put an ownerless colour back on the canvas: paint,
@@ -4239,13 +5132,13 @@ mod tests {
         let mut palette = Palette::new();
         palette.push("ember", RED).expect("fresh");
         let mut picker = Picker::new(Canvas::from_text("ab").expect("valid")).with_palette(palette);
-        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED); // painted before the session
+        picker.canvas_mut().cell_mut(0, 0).unwrap().ink = Some(RED.into()); // painted before the session
         picker.set_focus(Focus::Swatch { at: 0 });
         press(&mut picker, &[ENTER]);
         picker.set_focus(Focus::Cell { x: 1, y: 0 });
         press(&mut picker, &[ENTER]); // paint b red, recorded as None -> RED
 
-        let moved = Rgb::new(20, 200, 40);
+        let moved: Ink = Rgb::new(20, 200, 40).into();
         picker.set_swatch_color("ember", moved).expect("free");
         assert_eq!(inks(&picker, 0)[1], Some(moved));
 
@@ -4313,7 +5206,7 @@ mod tests {
 
         assert_eq!(after.len(), before + 1, "one new row");
         let swatch = picker.palette().at(0).expect("just added");
-        let colour = swatch.color();
+        let colour = rgb(swatch.color());
         assert!(
             after[0].contains(&format!("\x1b[48;2;{};{};{}m", colour.r, colour.g, colour.b)),
             "drawn in the colour it was given: {:?}",

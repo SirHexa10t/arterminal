@@ -2,7 +2,7 @@
 //!
 //! # Two things are unique here, and they do different jobs
 //!
-//! **Colour is identity.** No two swatches may hold the same [`Rgb`], because a canvas cell
+//! **Colour is identity.** No two swatches may hold the same [`Ink`], because a canvas cell
 //! records the colour itself rather than a reference to a swatch — so if two swatches shared a
 //! colour, nothing could say which of them a given cell belongs to, and "recolour every cell
 //! using this swatch" would have no answer. Uniqueness is what makes that operation meaningful.
@@ -18,7 +18,7 @@
 //! something else — and an opaque stable one is a field nobody reading the file cares about.
 //! A unique label is a stable handle that also happens to mean something.
 
-use crate::color::{Hsb, Rgb, Rng};
+use crate::color::{Hsb, Ink, Rgb, Rng};
 use std::fmt;
 
 /// How a derived swatch is displaced from the one it follows, in the space colours are picked in.
@@ -60,7 +60,7 @@ pub struct Derivation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Swatch {
     label: String,
-    color: Rgb,
+    color: Ink,
     derivation: Option<Derivation>,
 }
 
@@ -71,7 +71,7 @@ impl Swatch {
 
     /// The colour as it stands. For a derived swatch this is the RESOLVED colour, already
     /// recomputed — nothing downstream has to know it was derived in order to draw it.
-    pub fn color(&self) -> Rgb {
+    pub fn color(&self) -> Ink {
         self.color
     }
 
@@ -92,8 +92,12 @@ impl Palette {
     }
 
     /// Add a swatch of its own colour.
-    pub fn push(&mut self, label: impl Into<String>, color: Rgb) -> Result<(), PaletteError> {
-        let label = label.into();
+    pub fn push(
+        &mut self,
+        label: impl Into<String>,
+        color: impl Into<Ink>,
+    ) -> Result<(), PaletteError> {
+        let (label, color) = (label.into(), color.into());
         check_label_shape(&label)?;
         self.check_label_free(&label)?;
         self.check_color_free(color, None)?;
@@ -106,7 +110,7 @@ impl Palette {
     /// For colours that arrive without one — a drawing loaded from a file that never had a
     /// palette, or a random draw. Names are counted rather than derived from the colour: a label
     /// is a durable handle, and one that was never a description cannot become a lie.
-    pub fn push_unnamed(&mut self, color: Rgb) -> Result<String, PaletteError> {
+    pub fn push_unnamed(&mut self, color: impl Into<Ink>) -> Result<String, PaletteError> {
         let label = self.free_label();
         self.push(label.clone(), color)?;
         Ok(label)
@@ -153,11 +157,12 @@ impl Palette {
         let (label, base) = (label.into(), base.into());
         check_label_shape(&label)?;
         self.check_label_free(&label)?;
-        let base_color = match self.get(&base) {
-            Some(swatch) => swatch.color,
+        let base_color = match self.get(&base).map(Swatch::color) {
+            Some(Ink::Rgb(color)) => color,
+            Some(Ink::Slot(_)) => return Err(PaletteError::IrregularBase { label: base }),
             None => return Err(PaletteError::UnknownBase { label: base }),
         };
-        let color = Rgb::from_hsb(offset.apply(base_color.to_hsb()));
+        let color = Ink::Rgb(Rgb::from_hsb(offset.apply(base_color.to_hsb())));
         self.check_color_free(color, None)?;
         self.swatches.push(Swatch { label, color, derivation: Some(Derivation { base, offset }) });
         Ok(())
@@ -183,7 +188,7 @@ impl Palette {
     pub fn free_random_color(&self, rng: &mut Rng) -> Result<Rgb, PaletteError> {
         (0..RANDOM_TRIES)
             .map(|_| Rgb::random(rng))
-            .find(|color| self.check_color_free(*color, None).is_ok())
+            .find(|color| self.check_color_free(Ink::Rgb(*color), None).is_ok())
             .ok_or(PaletteError::NoFreeColor)
     }
 
@@ -197,13 +202,17 @@ impl Palette {
     /// collisions between two derived swatches that the caller never mentioned. Nothing is
     /// changed in that case, and the error names the swatch that blocked it: an edit that half
     /// applied would leave the palette in a state its own rules forbid.
-    pub fn set_color(&mut self, label: &str, color: Rgb) -> Result<Recolour, PaletteError> {
+    pub fn set_color(
+        &mut self,
+        label: &str,
+        color: impl Into<Ink>,
+    ) -> Result<Recolour, PaletteError> {
         let Some(at) = self.position(label) else {
             return Err(PaletteError::UnknownLabel { label: label.to_string() });
         };
-        let mut proposed: Vec<Rgb> = self.swatches.iter().map(Swatch::color).collect();
-        proposed[at] = color;
-        self.resolve_from(at, &mut proposed);
+        let mut proposed: Vec<Ink> = self.swatches.iter().map(Swatch::color).collect();
+        proposed[at] = color.into();
+        self.resolve_from(at, &mut proposed)?;
 
         // Checked against the WHOLE proposal rather than against the palette as it stands: two
         // swatches can be pushed onto each other by the same move, and neither holds the colour
@@ -264,7 +273,8 @@ impl Palette {
     }
 
     /// The swatch holding `color`, if any. The reverse lookup that colour-as-identity buys.
-    pub fn holder_of(&self, color: Rgb) -> Option<&Swatch> {
+    pub fn holder_of(&self, color: impl Into<Ink>) -> Option<&Swatch> {
+        let color = color.into();
         self.swatches.iter().find(|swatch| swatch.color == color)
     }
 
@@ -297,7 +307,7 @@ impl Palette {
         }
     }
 
-    fn check_color_free(&self, color: Rgb, except: Option<usize>) -> Result<(), PaletteError> {
+    fn check_color_free(&self, color: Ink, except: Option<usize>) -> Result<(), PaletteError> {
         match self
             .swatches
             .iter()
@@ -318,7 +328,10 @@ impl Palette {
     /// overflow the stack. Each swatch is resolved at most once because a derivation forms a
     /// forest: every swatch has at most one base, and cycles cannot be built (see
     /// [`Palette::push_derived`]).
-    fn resolve_from(&self, at: usize, proposed: &mut [Rgb]) {
+    ///
+    /// Refused if a swatch something follows would become a terminal palette slot: see
+    /// [`PaletteError::IrregularBase`].
+    fn resolve_from(&self, at: usize, proposed: &mut [Ink]) -> Result<(), PaletteError> {
         let mut moved = vec![self.swatches[at].label.clone()];
         while let Some(base) = moved.pop() {
             for (index, swatch) in self.swatches.iter().enumerate() {
@@ -327,11 +340,15 @@ impl Palette {
                     continue;
                 }
                 let offset = swatch.derivation.as_ref().expect("just matched").offset;
-                let from = proposed[self.position(&base).expect("base exists")];
-                proposed[index] = Rgb::from_hsb(offset.apply(from.to_hsb()));
+                let from = match proposed[self.position(&base).expect("base exists")] {
+                    Ink::Rgb(from) => from,
+                    Ink::Slot(_) => return Err(PaletteError::IrregularBase { label: base }),
+                };
+                proposed[index] = Ink::Rgb(Rgb::from_hsb(offset.apply(from.to_hsb())));
                 moved.push(swatch.label.clone());
             }
         }
+        Ok(())
     }
 
     /// A name no swatch is using: `colour 1`, then `colour 2`, and so on.
@@ -377,12 +394,12 @@ const RANDOM_TRIES: usize = 32;
 /// What a colour change did: every `(was, now)` pair it produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recolour {
-    changes: Vec<(Rgb, Rgb)>,
+    changes: Vec<(Ink, Ink)>,
 }
 
 impl Recolour {
     /// The pairs, in palette order. Empty when the colour asked for was already the colour held.
-    pub fn changes(&self) -> &[(Rgb, Rgb)] {
+    pub fn changes(&self) -> &[(Ink, Ink)] {
         &self.changes
     }
 
@@ -395,7 +412,12 @@ impl Recolour {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteError {
     /// Two swatches may not share a colour — see the module docs.
-    DuplicateColor { color: Rgb, held_by: String },
+    DuplicateColor { color: Ink, held_by: String },
+    /// A swatch cannot follow a terminal palette slot, nor become one while anything follows it.
+    /// Not because its colour is unknown — slots 16-255 are defined exactly — but because a
+    /// slot's MEANING belongs to the terminal: a derivation computed from it would freeze one
+    /// terminal's reading of the slot into the file.
+    IrregularBase { label: String },
     /// Two swatches may not share a name, because a derivation names its base by label.
     DuplicateLabel { label: String },
     /// A derivation pointed at a swatch that is not here.
@@ -425,6 +447,11 @@ impl fmt::Display for PaletteError {
             Self::UnknownBase { label } => write!(f, "no swatch called {label:?} to follow"),
             Self::UnknownLabel { label } => write!(f, "no swatch called {label:?}"),
             Self::NoFreeColor => write!(f, "every colour a random draw can reach is already taken"),
+            Self::IrregularBase { label } => write!(
+                f,
+                "{label:?} is a terminal palette slot, and a swatch cannot follow one: what a \
+                 slot looks like is the terminal's to say"
+            ),
             Self::BadLabel { label, why } => write!(f, "{label:?}: {why}"),
             Self::InUse { label, by } => {
                 write!(f, "{label:?} cannot be removed while {by:?} still follows it")
@@ -438,6 +465,12 @@ impl std::error::Error for PaletteError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The colour of the swatch called `label`, which these tests only ever give colours of their
+    /// own.
+    fn rgb_of(palette: &Palette, label: &str) -> Rgb {
+        palette.get(label).and_then(|swatch| swatch.color().rgb()).expect("a colour of its own")
+    }
 
     fn palette(entries: &[(&str, Rgb)]) -> Palette {
         let mut palette = Palette::new();
@@ -462,7 +495,7 @@ mod tests {
     fn pushing_returns_a_swatch_that_reads_back() {
         let palette = palette(&[("ember", RED)]);
         let swatch = palette.get("ember").expect("just pushed");
-        assert_eq!(swatch.color(), RED);
+        assert_eq!(swatch.color(), RED.into());
         assert_eq!(swatch.label(), "ember");
         assert_eq!(swatch.derivation(), None, "pushed with a colour of its own");
     }
@@ -474,7 +507,7 @@ mod tests {
         let mut palette = palette(&[("ember", RED)]);
         assert_eq!(
             palette.push("flame", RED),
-            Err(PaletteError::DuplicateColor { color: RED, held_by: "ember".into() })
+            Err(PaletteError::DuplicateColor { color: RED.into(), held_by: "ember".into() })
         );
         assert_eq!(palette.len(), 1, "and nothing was added");
         assert!(palette.push("flame", RED).unwrap_err().to_string().contains("ember"));
@@ -499,9 +532,9 @@ mod tests {
 
         let expected = Rgb::from_hsb(darker.apply(RED.to_hsb()));
         let swatch = palette.get("shade").expect("just pushed");
-        assert_eq!(swatch.color(), expected);
+        assert_eq!(swatch.color(), expected.into());
         assert_eq!(swatch.derivation().map(|d| d.base.as_str()), Some("base"));
-        assert!(swatch.color() != RED, "a derived swatch is still its own colour");
+        assert!(swatch.color() != RED.into(), "a derived swatch is still its own colour");
     }
 
     #[test]
@@ -535,15 +568,15 @@ mod tests {
         palette.push_derived("deep", "shade", darkest).expect("a chain is allowed");
 
         let recolour = palette.set_color("base", BLUE).expect("no collision");
-        assert_eq!(palette.get("base").unwrap().color(), BLUE);
+        assert_eq!(palette.get("base").unwrap().color(), BLUE.into());
         assert_eq!(
             palette.get("shade").unwrap().color(),
-            Rgb::from_hsb(darker.apply(BLUE.to_hsb())),
+            Rgb::from_hsb(darker.apply(BLUE.to_hsb())).into(),
             "the follower moved with it"
         );
         assert_eq!(
             palette.get("deep").unwrap().color(),
-            Rgb::from_hsb(darkest.apply(palette.get("shade").unwrap().color().to_hsb())),
+            Rgb::from_hsb(darkest.apply(rgb_of(&palette, "shade").to_hsb())).into(),
             "and so did what follows the follower"
         );
         assert_eq!(recolour.changes().len(), 3, "all three reported: {recolour:?}");
@@ -554,7 +587,7 @@ mod tests {
     fn a_recolour_reports_what_changed_and_only_what_changed() {
         let mut palette = palette(&[("ember", RED), ("sky", BLUE)]);
         let recolour = palette.set_color("ember", Rgb::new(1, 2, 3)).expect("free");
-        assert_eq!(recolour.changes(), [(RED, Rgb::new(1, 2, 3))]);
+        assert_eq!(recolour.changes(), [(RED.into(), Rgb::new(1, 2, 3).into())]);
         assert!(!recolour.is_empty());
 
         let nothing = palette.set_color("sky", BLUE).expect("already that colour");
@@ -568,7 +601,7 @@ mod tests {
         let before = palette.clone();
         assert_eq!(
             palette.set_color("ember", BLUE),
-            Err(PaletteError::DuplicateColor { color: BLUE, held_by: "ember".into() })
+            Err(PaletteError::DuplicateColor { color: BLUE.into(), held_by: "ember".into() })
         );
         assert_eq!(palette, before, "nothing moved");
     }
@@ -618,7 +651,7 @@ mod tests {
         palette.set_color("ember", BLUE).expect("no collision");
         assert_eq!(
             palette.get("shade").unwrap().color(),
-            Rgb::from_hsb(darker.apply(BLUE.to_hsb()))
+            Rgb::from_hsb(darker.apply(BLUE.to_hsb())).into()
         );
     }
 
@@ -712,7 +745,7 @@ mod removal_and_naming_tests {
         palette.push("ember", RED).unwrap();
         palette.push("sky", BLUE).unwrap();
         let taken = palette.remove("ember").expect("nothing follows it");
-        assert_eq!((taken.label(), taken.color()), ("ember", RED));
+        assert_eq!((taken.label(), taken.color()), ("ember", RED.into()));
         assert_eq!(palette.get("ember"), None);
         assert_eq!(palette.len(), 1);
         assert_eq!(

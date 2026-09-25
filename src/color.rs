@@ -171,6 +171,125 @@ impl fmt::Display for Rgb {
     }
 }
 
+/// What a cell is inked with, and what a swatch holds: a colour of its own, or one of the
+/// terminal's palette SLOTS — the 16 and 256 colours an escape can name by number instead.
+///
+/// A slot is not a colour but a place in the terminal's palette. The first sixteen are the
+/// theme's, and a terminal can be told to change any of the 256. So a slot is kept AS A SLOT:
+/// drawn through the terminal, which shows it exactly as this terminal shows it, and written back
+/// as the code that named it — never pinned to an RGB it might not have. [`Ink::approximate`]
+/// gives the RGB it usually is, for the few decisions that need one, like which of black or white
+/// stands out on it.
+///
+/// Colour is identity for both kinds, and a slot never equals a colour: slot 196 and `#ff0000`
+/// look alike on most terminals, but only one of them follows the terminal's palette, so they are
+/// two colours, and can be two swatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ink {
+    /// A colour of its own, the same everywhere.
+    Rgb(Rgb),
+    /// A slot of the terminal's 256-colour palette.
+    Slot(u8),
+}
+
+impl From<Rgb> for Ink {
+    fn from(rgb: Rgb) -> Self {
+        Self::Rgb(rgb)
+    }
+}
+
+impl Ink {
+    /// The RGB this ink is: exactly, for a colour of its own; for a slot, what xterm's default
+    /// table holds there — exact for 16-255, a guess for the theme's 0-15. See [`palette_colour`].
+    pub fn approximate(self) -> Rgb {
+        match self {
+            Self::Rgb(rgb) => rgb,
+            Self::Slot(slot) => palette_colour(slot),
+        }
+    }
+
+    /// The colour, when this is one of its own; `None` for a slot.
+    pub fn rgb(self) -> Option<Rgb> {
+        match self {
+            Self::Rgb(rgb) => Some(rgb),
+            Self::Slot(_) => None,
+        }
+    }
+
+    /// Whether this is one of the sixteen slots that take the terminal THEME's colours, and so
+    /// can look different on every terminal. Slots 16-255 are defined exactly.
+    pub fn follows_theme(self) -> bool {
+        matches!(self, Self::Slot(0..=15))
+    }
+
+    /// Read `#rrggbb` — the hash optional, either case — or `slot 196`, as [`Ink`]'s `Display`
+    /// writes them. A slot outside 0-255 is refused, not wrapped or clamped.
+    pub fn parse(text: &str) -> Result<Self, ColorParseError> {
+        match text.strip_prefix("slot") {
+            Some(number) => number
+                .trim_start()
+                .parse::<u8>()
+                .map(Self::Slot)
+                .map_err(|_| ColorParseError { found: text.to_string() }),
+            None => Rgb::from_hex(text).map(Self::Rgb),
+        }
+    }
+}
+
+/// `#rrggbb` for a colour of its own, `slot 196` for a slot — the spelling a palette line uses.
+impl fmt::Display for Ink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rgb(rgb) => rgb.fmt(f),
+            Self::Slot(slot) => write!(f, "slot {slot}"),
+        }
+    }
+}
+
+/// The colour a terminal's 256-colour palette holds in slot `index`, by xterm's default table.
+///
+/// Slots 16-255 are defined exactly and every terminal agrees on them: a 6×6×6 cube on the levels
+/// 0, 95, 135, 175, 215 and 255, then a ramp of greys from 8 to 238 in steps of 10. Slots 0-15
+/// are the theme's own sixteen colours, which differ from terminal to terminal and are usually
+/// changed by the user; xterm's defaults stand in for them here — which are NOT the old VGA values
+/// some terminals ship — so for those this is a best guess, and is called one.
+pub fn palette_colour(index: u8) -> Rgb {
+    const SIXTEEN: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match index {
+        0..=15 => {
+            let (r, g, b) = SIXTEEN[index as usize];
+            Rgb::new(r, g, b)
+        }
+        16..=231 => {
+            let cube = index - 16;
+            let (r, g, b) = (cube / 36, cube / 6 % 6, cube % 6);
+            Rgb::new(LEVELS[r as usize], LEVELS[g as usize], LEVELS[b as usize])
+        }
+        232..=255 => {
+            let grey = 8 + 10 * (index - 232);
+            Rgb::new(grey, grey, grey)
+        }
+    }
+}
+
 /// What [`Rgb::from_hex`] rejected, kept whole so the message can quote it back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColorParseError {
@@ -179,7 +298,7 @@ pub struct ColorParseError {
 
 impl fmt::Display for ColorParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "expected a colour like #1e90ff, found {:?}", self.found)
+        write!(f, "expected a colour like #1e90ff or slot 196, found {:?}", self.found)
     }
 }
 
@@ -396,5 +515,48 @@ mod tests {
             seen.insert(colour);
         }
         assert!(seen.len() > 50, "64 draws gave only {} distinct colours", seen.len());
+    }
+
+    /// An ink is written the way a palette line spells it, and read back from that spelling: a
+    /// colour of its own as hex, a slot as `slot n`. A slot past 255 is refused, not wrapped.
+    #[test]
+    fn an_ink_round_trips_through_its_spelling() {
+        for ink in [Ink::Rgb(Rgb::new(30, 144, 255)), Ink::Slot(0), Ink::Slot(196), Ink::Slot(255)]
+        {
+            assert_eq!(Ink::parse(&ink.to_string()), Ok(ink), "{ink}");
+        }
+        assert_eq!(Ink::Slot(24).to_string(), "slot 24");
+        assert_eq!(Ink::parse("slot24"), Ok(Ink::Slot(24)), "the space is optional");
+        let refused = Ink::parse("slot 256").expect_err("no slot 256");
+        assert!(refused.to_string().contains("slot 196"), "and says what would do: {refused}");
+    }
+
+    /// A slot is never a colour of its own, whatever it looks like — only one of them follows
+    /// the terminal's palette — and only the first sixteen follow the theme.
+    #[test]
+    fn a_slot_is_its_own_identity_and_only_sixteen_follow_the_theme() {
+        assert_ne!(Ink::Slot(196), Ink::Rgb(palette_colour(196)), "alike, and still two colours");
+        assert_eq!(Ink::Slot(196).approximate(), Rgb::new(255, 0, 0));
+        assert_eq!(Ink::Rgb(Rgb::new(1, 2, 3)).approximate(), Rgb::new(1, 2, 3), "exact");
+        assert!(Ink::Slot(15).follows_theme() && !Ink::Slot(16).follows_theme());
+        assert!(!Ink::Rgb(Rgb::new(0, 0, 0)).follows_theme());
+    }
+
+    /// The palette slots, from xterm's default table: 16-255 are exact and agreed everywhere;
+    /// 0-15 are the theme's, and xterm's defaults stand in for them.
+    #[test]
+    fn palette_slots_map_to_xterms_default_table() {
+        for (index, rgb) in [
+            (1, (205, 0, 0)),
+            (9, (255, 0, 0)),
+            (16, (0, 0, 0)),
+            (21, (0, 0, 255)),
+            (196, (255, 0, 0)),
+            (231, (255, 255, 255)),
+            (232, (8, 8, 8)),
+            (255, (238, 238, 238)),
+        ] {
+            assert_eq!(palette_colour(index), Rgb::new(rgb.0, rgb.1, rgb.2), "slot {index}");
+        }
     }
 }

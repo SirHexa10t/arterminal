@@ -1,6 +1,6 @@
 //! The drawing itself: a rectangular grid of cells, and the loader that reads one from text.
 
-use crate::color::Rgb;
+use crate::color::Ink;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// `ink` is `None` for "whatever the terminal's default foreground is" — which is every cell of
 /// a canvas loaded from plain text, since plain text carries no colour.
 ///
-/// It holds the [`Rgb`] itself rather than a reference to a swatch, which is what makes a canvas
+/// It holds the [`Ink`] itself rather than a reference to a swatch, which is what makes a canvas
 /// printable as it stands. Editing a swatch still recolours the drawing, but by rewriting every
 /// cell holding that colour rather than by indirection — see
 /// [`Picker::set_swatch_color`](crate::Picker::set_swatch_color). That trade is sound only while
@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub glyph: char,
-    pub ink: Option<Rgb>,
+    /// A colour of its own or a terminal palette slot — see [`Ink`] — or the terminal's own
+    /// colour when `None`.
+    pub ink: Option<Ink>,
 }
 
 impl Cell {
@@ -111,8 +113,13 @@ impl Canvas {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, LoadError> {
         let path = path.as_ref();
         let at = |source| LoadError { path: path.to_path_buf(), source };
-        let text = std::fs::read_to_string(path).map_err(|err| at(LoadCause::Io(err)))?;
+        let text = read_text(path).map_err(at)?;
         Self::from_text(&text).map_err(|err| at(LoadCause::Canvas(err)))
+    }
+
+    /// Bytes the cells take in memory — a cell for every column of every row.
+    pub fn bytes(&self) -> usize {
+        self.cells.capacity() * std::mem::size_of::<Cell>()
     }
 
     pub fn width(&self) -> usize {
@@ -210,11 +217,16 @@ impl fmt::Display for CanvasError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "no canvas here: the text is empty"),
-            Self::Control { at, glyph } => write!(
+            // The advice only where it is the answer: a tab can be expanded, an ESC or a NUL
+            // cannot, and suggesting it for one would send the reader looking for tabs.
+            Self::Control { at, glyph: '\t' } => write!(
                 f,
-                "{at}: {glyph:?} is a control character and has no column of its own \
+                "{at}: a tab is a control character and has no column of its own \
                  (expand tabs before loading)"
             ),
+            Self::Control { at, glyph } => {
+                write!(f, "{at}: {glyph:?} is a control character and has no column of its own")
+            }
             Self::WideGlyph { at, glyph, width } => write!(
                 f,
                 "{at}: {glyph:?} is {width} columns wide, and a canvas cell is exactly one"
@@ -236,6 +248,10 @@ pub struct LoadError {
 #[derive(Debug)]
 pub enum LoadCause {
     Io(std::io::Error),
+    /// The file is UTF-16 — its first two bytes are a UTF-16 byte-order mark — and art files are
+    /// UTF-8. Said outright, because read as UTF-8 it is either refused with a message about
+    /// streams or, worse, garbled.
+    Utf16,
     Canvas(CanvasError),
     Document(crate::document::DocumentError),
 }
@@ -244,10 +260,29 @@ impl fmt::Display for LoadCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => err.fmt(f),
+            Self::Utf16 => {
+                write!(f, "this file is UTF-16 (its first bytes say so); save it as UTF-8")
+            }
             Self::Canvas(err) => err.fmt(f),
             Self::Document(err) => err.fmt(f),
         }
     }
+}
+
+/// A file's text, as every loader here reads it: UTF-8, with a UTF-8 byte-order mark — which
+/// editors on Windows like to write — taken off rather than refused as a glyph with no width,
+/// and a UTF-16 file named as such.
+pub(crate) fn read_text(path: &Path) -> Result<String, LoadCause> {
+    let bytes = std::fs::read(path).map_err(LoadCause::Io)?;
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+        return Err(LoadCause::Utf16);
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|err| LoadCause::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_string(),
+        None => text,
+    })
 }
 
 /// Always `path: reason`. The path leads, because it is what tells the reader which of several
@@ -262,6 +297,7 @@ impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.source {
             LoadCause::Io(err) => Some(err),
+            LoadCause::Utf16 => None,
             LoadCause::Canvas(err) => Some(err),
             LoadCause::Document(err) => Some(err),
         }
@@ -395,8 +431,8 @@ mod tests {
         let ink = crate::Rgb::new(1, 2, 3);
         palette.push("ink", ink).expect("a fresh palette");
         let mut canvas = Canvas::from_text("ab").expect("valid");
-        canvas.cell_mut(1, 0).expect("in bounds").ink = Some(ink);
-        assert_eq!(canvas.cell(1, 0).unwrap().ink, Some(ink));
+        canvas.cell_mut(1, 0).expect("in bounds").ink = Some(ink.into());
+        assert_eq!(canvas.cell(1, 0).unwrap().ink, Some(ink.into()));
         assert_eq!(canvas.cell(0, 0).unwrap().ink, None, "its neighbour is untouched");
     }
 
@@ -426,5 +462,40 @@ mod tests {
         let loaded = Canvas::load(&path).expect("valid art");
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, Canvas::from_text("⣿⡇\n⢹⡇\n").unwrap());
+    }
+
+    /// A cell is eight bytes whichever ink it holds — a slot costs nothing over a colour — and the
+    /// whole of a canvas's size estimate rests on that. Pinned here, because nothing in the
+    /// language promises the layout it happens to get.
+    #[test]
+    fn a_cell_is_eight_bytes() {
+        assert_eq!(std::mem::size_of::<Cell>(), 8);
+    }
+
+    /// Only a tab is told to expand tabs: the advice is wrong for any other control character.
+    #[test]
+    fn the_tab_advice_is_given_for_tabs_alone() {
+        let tab = Canvas::from_text("a\tb").expect_err("refused").to_string();
+        assert!(tab.contains("expand tabs"), "{tab}");
+        let nul = Canvas::from_text("a\0b").expect_err("refused").to_string();
+        assert!(nul.contains("control character") && !nul.contains("tab"), "{nul}");
+    }
+
+    /// A UTF-8 byte-order mark, which Windows editors like to write, is taken off rather than
+    /// refused as a glyph with no width; a UTF-16 file is refused, and told so in as many words.
+    #[test]
+    fn a_byte_order_mark_is_taken_off_and_utf16_is_named() {
+        let dir = std::env::temp_dir().join(format!("arterminal-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let marked = dir.join("marked.txt");
+        std::fs::write(&marked, "\u{feff}ab\n").expect("written");
+        assert_eq!(Canvas::load(&marked).expect("loads"), Canvas::from_text("ab").unwrap());
+
+        let wide = dir.join("utf16.txt");
+        std::fs::write(&wide, [0xff, 0xfe, b'a', 0, b'b', 0]).expect("written");
+        let refused = Canvas::load(&wide).expect_err("refused");
+        assert!(matches!(refused.source, LoadCause::Utf16), "{refused}");
+        assert!(refused.to_string().contains("UTF-16"), "{refused}");
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
     }
 }

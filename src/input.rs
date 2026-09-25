@@ -110,6 +110,16 @@ pub(crate) enum Readiness {
 /// re-raises would close it; it is deliberately a separate decision, not built yet.
 pub(crate) struct KeyboardProtocol;
 
+/// What the terminal agreed to, of the flags asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Granted {
+    /// Key releases arrive: flags 2 and 8 both — see [`KeyboardProtocol::FLAGS`].
+    pub(crate) releases: bool,
+    /// Modified keys arrive unambiguous — flag 1 — so Shift on a Ctrl chord is reported, and
+    /// Ctrl+Shift+Z is told from Ctrl+Z. A classic terminal sends one byte for both.
+    pub(crate) shift_on_ctrl: bool,
+}
+
 impl KeyboardProtocol {
     /// The flags asked for: disambiguate (1), event types (2), every key as an escape (8), and the
     /// text each key produced (16).
@@ -125,21 +135,23 @@ impl KeyboardProtocol {
 
     /// Ask whether the terminal speaks the protocol and, if it does, turn it on.
     ///
-    /// Returns the guard and whether releases will really arrive: a terminal can answer the query
-    /// and still decline some flags, so after pushing them it is asked again. Keys typed while
-    /// this runs are not lost — they are decoded into `backlog` for the caller to replay.
+    /// Returns the guard and what was really granted: a terminal can answer the query and still
+    /// decline some flags, so after pushing them it is asked again. Keys typed while this runs are
+    /// not lost — they are decoded into `backlog` for the caller to replay.
     pub(crate) fn engage(
         fd: std::os::fd::RawFd,
         decoder: &mut crate::keys::Decoder,
         backlog: &mut Vec<crate::keys::KeyEvent>,
-    ) -> std::io::Result<Option<(Self, bool)>> {
+    ) -> std::io::Result<Option<(Self, Granted)>> {
         if query_flags(fd, decoder, backlog)?.is_none() {
             return Ok(None);
         }
         write_to_terminal(&format!("\x1b[>{}u", Self::FLAGS))?;
         let guard = Self;
-        let granted = query_flags(fd, decoder, backlog)?.unwrap_or(0);
-        Ok(Some((guard, granted & 0b1010 == 0b1010)))
+        let flags = query_flags(fd, decoder, backlog)?.unwrap_or(0);
+        let granted =
+            Granted { releases: flags & 0b1010 == 0b1010, shift_on_ctrl: flags & 0b1 != 0 };
+        Ok(Some((guard, granted)))
     }
 }
 
@@ -176,9 +188,68 @@ fn query_flags(
                 Decoded::KeyboardFlags(value) => flags = Some(value),
                 Decoded::DeviceAttributes => return Ok(flags),
                 Decoded::Key(key) => backlog.push(key),
+                Decoded::CursorPosition { .. } => {}
             }
         }
     }
+}
+
+/// Whether this terminal draws East Asian Ambiguous characters two columns wide — MEASURED, by
+/// drawing one (`·`) at the start of the line and asking where the cursor went: column 2 is one
+/// cell, column 3 two. `None` when the terminal does not answer, so the caller can fall back to
+/// something weaker; the device attributes ride behind the question as its end marker, so a
+/// silent terminal costs nothing. The glyph is erased again either way.
+///
+/// Asked, not taken from the locale, because the setting belongs to the terminal: an English
+/// locale can run a terminal set to wide, and a Japanese one a terminal set to narrow.
+pub(crate) fn ambiguous_is_wide(
+    fd: std::os::fd::RawFd,
+    decoder: &mut crate::keys::Decoder,
+    backlog: &mut Vec<crate::keys::KeyEvent>,
+) -> std::io::Result<Option<bool>> {
+    use crate::keys::Decoded;
+    decoder.expect_cursor_report(true);
+    let asked = (|| -> std::io::Result<Option<u32>> {
+        write_to_terminal("\r\u{b7}\x1b[6n\x1b[c")?;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(QUERY_TIMEOUT_MS as u64);
+        let mut column = None;
+        loop {
+            let left =
+                deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+            if left == 0 || wait_for_input(fd, left)? != Readiness::Ready {
+                return Ok(column);
+            }
+            for decoded in decoder.feed(&read_available(fd)?) {
+                match decoded {
+                    Decoded::CursorPosition { col, .. } => column = Some(col),
+                    Decoded::DeviceAttributes => return Ok(column),
+                    Decoded::Key(key) => backlog.push(key),
+                    Decoded::KeyboardFlags(_) => {}
+                }
+            }
+        }
+    })();
+    decoder.expect_cursor_report(false);
+    write_to_terminal("\r\x1b[K")?;
+    Ok(asked?.map(|column| column >= 3))
+}
+
+/// The locale's word on ambiguous width, for a terminal that gave none: Chinese, Japanese and
+/// Korean locales are where terminals most often draw those characters wide. A weak guess — the
+/// setting is the terminal's own — so it is only ever the fallback for [`ambiguous_is_wide`].
+pub(crate) fn locale_says_wide() -> bool {
+    locale_is_cjk(
+        ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+            .as_deref(),
+    )
+}
+
+/// Whether the locale `name` is a Chinese, Japanese or Korean one.
+fn locale_is_cjk(name: Option<&str>) -> bool {
+    name.is_some_and(|name| ["ja", "zh", "ko"].iter().any(|lang| name.starts_with(lang)))
 }
 
 /// A control sequence to the terminal, flushed at once. Stderr, because that is where the picker
