@@ -1,0 +1,85 @@
+//! Terminal ASCII art with colour.
+//!
+//! A library first: every feature the bundled `arterminal` binary has is a function here, so a
+//! program embedding this crate is never the second-class caller.
+//!
+//! # The pieces
+//!
+//! A [`Canvas`] is a rectangular grid of [`Cell`]s — one character each, loaded from plain text.
+//! A [`Palette`] is the colours that drawing may use, each under a unique name and each a
+//! unique colour. A cell holds its [`Rgb`] directly, which is what makes a canvas printable as it
+//! stands; editing a swatch still recolours the drawing, by rewriting every cell holding that
+//! colour — see [`Picker::set_swatch_color`]. A [`Picker`] puts the two together and lets someone
+//! walk over both with the arrow keys.
+//!
+//! ```no_run
+//! use arterminal::Picker;
+//!
+//! // Art, colours and palette all come from the one file, and go back to it on Ctrl+S.
+//! let mut picker = Picker::open("art.txt")?;
+//! arterminal::run(&mut picker)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Or built in code, with nowhere to save to unless told:
+//!
+//! ```no_run
+//! use arterminal::{Canvas, Picker, Palette, Rgb};
+//!
+//! let mut palette = Palette::new();
+//! palette.push("sky", Rgb::from_hex("#1e90ff")?)?;
+//! let mut picker = Picker::new(Canvas::from_text("⣿⡇\n⢹⡇")?).with_palette(palette);
+//! arterminal::run(&mut picker)?;
+//! picker.save_to("out.txt")?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Driving it yourself
+//!
+//! [`run`] takes the terminal over. A program that already owns its screen can instead call
+//! [`ui::render`] for the lines and [`ui::apply`] for the key handling, and composite the result
+//! wherever it likes. Both are pure functions over state, which is also why the whole picker is
+//! testable without a terminal.
+//!
+//! ```
+//! use arterminal::{Canvas, Focus, Key, Picker};
+//! use arterminal::ui::{apply, render, Action};
+//!
+//! let mut picker = Picker::new(Canvas::from_text("ab\ncd")?);
+//! assert_eq!(picker.focus(), Focus::Add, "no swatches yet, so the cursor starts on [+]");
+//!
+//! assert_eq!(apply(&mut picker, Key::Enter), Action::Redraw);
+//! assert_eq!(picker.palette().len(), 1, "enter on [+] added a colour");
+//!
+//! let lines = render(&picker, 40, 12);
+//! assert!(lines.iter().any(|line| line.contains("[+]")));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Terminal support
+//!
+//! Colours are 24-bit throughout and are emitted as such. Terminals that only do the 256-colour
+//! palette will show the nearest thing they can rather than the exact colour; down-converting
+//! for them is not yet implemented, and when it is it will happen at the point of drawing, never
+//! by narrowing what a [`Rgb`] can hold.
+
+pub mod canvas;
+pub mod color;
+pub mod cursor;
+pub mod document;
+pub mod palette;
+pub mod ui;
+
+mod input;
+mod paint;
+
+/// Re-exported from `console`, because [`ui::apply`] takes one: an embedder should be able to
+/// name every type in this crate's signatures without adding a dependency of its own.
+pub use console::Key;
+
+pub use crate::canvas::{At, Canvas, CanvasError, Cell, LoadCause, LoadError};
+pub use crate::color::{ColorParseError, Hsb, Rgb, Rng};
+pub use crate::cursor::{Dir, Focus};
+pub use crate::document::{Document, DocumentError};
+pub use crate::palette::{Derivation, HsbOffset, Palette, PaletteError, Recolour, Swatch};
+pub use crate::ui::{run, Action, Outcome, Picker};

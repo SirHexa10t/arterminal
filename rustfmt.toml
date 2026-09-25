@@ -1,0 +1,17 @@
+# Recovered from the sibling project `terminal_choice` rather than chosen: its sources are
+# formatted this way but it ships no config, so the settings live in a contributor's editor
+# instead of in the repo. Measured, not guessed — running `rustfmt --check` over that project's
+# `src/ui.rs` reports 2298 differing lines under rustfmt's defaults and 356 under these, so this
+# pair is what its author's formatter was actually set to.
+#
+# Written down here so `cargo fmt` is reproducible for anyone who clones this, and so nobody has
+# to discover the house style by having their editor fight the diff.
+
+# The sibling's lines run to 100 columns, comments included.
+max_width = 100
+
+# Keep short constructs on one line rather than exploding every small struct literal, match arm
+# and call across several. This is the single setting that accounts for most of the difference
+# above, and it is what makes the dense `match { true => .., false => .. }` idiom both projects
+# use read as one thought instead of five lines.
+use_small_heuristics = "Max"
