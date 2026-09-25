@@ -172,13 +172,19 @@ impl Palette {
     /// simply a redraw, not a failure. It gives up after a bounded number of draws rather than
     /// looping for ever on a palette that has taken the whole ring.
     pub fn push_random(&mut self, rng: &mut Rng) -> Result<String, PaletteError> {
-        for _ in 0..RANDOM_TRIES {
-            let color = Rgb::random(rng);
-            if self.check_color_free(color, None).is_ok() {
-                return self.push_unnamed(color);
-            }
-        }
-        Err(PaletteError::NoFreeColor)
+        let color = self.free_random_color(rng)?;
+        self.push_unnamed(color)
+    }
+
+    /// A random colour no swatch here holds — for a new swatch, or for moving an old one.
+    ///
+    /// Draws a bounded number of times rather than looping: [`Rgb::random`] walks one ring of the
+    /// wheel, so a palette that has taken nearly all of it would otherwise spin for ever.
+    pub fn free_random_color(&self, rng: &mut Rng) -> Result<Rgb, PaletteError> {
+        (0..RANDOM_TRIES)
+            .map(|_| Rgb::random(rng))
+            .find(|color| self.check_color_free(*color, None).is_ok())
+            .ok_or(PaletteError::NoFreeColor)
     }
 
     /// Move a swatch to a new colour, carrying everything that follows it.

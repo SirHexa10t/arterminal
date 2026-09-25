@@ -38,24 +38,27 @@ fn every_style_follows_stderr_and_not_a_redirected_stdout() {
     let mut picker =
         Picker::new(Canvas::from_text("ab\ncd\nef\ngh").expect("valid")).with_palette(palette);
     assert!(picker.set_focus(Focus::Cell { x: 0, y: 0 }));
-    // Deliberately too short for the art, so the drop marker is drawn and can be checked too.
-    let lines = render(&picker, 200, 7);
+    // Deliberately too short for the art, so the window scrolls and the status row has to say
+    // which rows it is showing — the one piece of text only a short terminal draws.
+    let lines = render(&picker, 200, 10);
 
-    assert_eq!(lines.len(), 7, "swatch, button, gap, one art row, marker, status, hint: {lines:?}");
+    assert_eq!(
+        lines.len(),
+        10,
+        "swatch, button, gap, border, two art rows, status, 3 hints: {lines:?}"
+    );
 
     assert!(lines[0].contains("\x1b[48;2;30;144;255m"), "swatch lost its colour: {:?}", lines[0]);
-    assert!(lines[3].contains("\x1b[7m"), "cursor lost its inversion: {:?}", lines[3]);
+    assert!(lines[3].contains("\x1b[48;2;110;110;110m"), "border lost its grey: {:?}", lines[3]);
+    assert!(lines[4].contains("\x1b[7m"), "cursor lost its inversion: {:?}", lines[4]);
 
     // Attributes sit inside the same gate as the colours, so these die the same death.
-    let marker = &lines[4];
-    assert!(marker.contains("more rows"), "expected the drop marker: {marker:?}");
-    assert!(marker.contains("\x1b[2m"), "drop marker lost its dim: {marker:?}");
-
-    let status = &lines[5];
-    assert!(status.contains("brush"), "expected the status row: {status:?}");
+    let status = &lines[6];
+    assert!(status.contains("rows 1-2 of 4"), "expected where the window is: {status:?}");
     assert!(status.contains("\x1b[2m"), "status lost its dim: {status:?}");
 
-    let hint = &lines[6];
-    assert!(hint.contains("esc"), "expected the hint: {hint:?}");
-    assert!(hint.contains("\x1b[2m"), "hint lost its dim: {hint:?}");
+    let file = &lines[7];
+    assert!(file.contains("esc"), "expected the file's hint line: {file:?}");
+    assert!(file.contains("\x1b[2m"), "its dots lost their dim: {file:?}");
+    assert!(file.contains("\x1b[33m"), "its actions lost their colour: {file:?}");
 }

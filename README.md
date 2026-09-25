@@ -7,16 +7,23 @@ Open a text file of art, pick colours into a palette, paint them onto the charac
 colours are written back into the same file as terminal escapes, so `cat` shows the result.
 
 ```
-███     # colour 1  (brush)
-███     # colour 2
-[+]
+  ███     # colour 1  (brush)
+  ███     # colour 2
+  [+]
 
-⣿⡇⣿⣿⣿⠛⠁⣴⣿⡿⠿⠧⠹⠿⠘⣿⣿⣿⡇⢸⡻⣿⣿⣿⣿⣿⣿⣿
-⢹⡇⣿⣿⣿⠄⣞⣯⣷⣾⣿⣿⣧⡹⡆⡀⠉⢹⡌⠐⢿⣿⣿⣿⡞⣿⣿⣿
-⣾⡇⣿⣿⡇⣾⣿⣿⣿⣿⣿⣿⣿⣿⣄⢻⣦⡀⠁⢸⡌⠻⣿⣿⣿⡽⣿⣿
-brush: colour 1 · modified
-↑↓←→ move · space/enter pick or paint · backspace erase · ^S save · ^Z undo · ^Y redo · esc/^X close
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+  ▒⣿⡇⣿⣿⣿⠛⠁⣴⣿⡿⠿⠧⠹⠿⠘⣿⣿⣿⡇⢸⡻⣿⣿⣿⣿⣿⣿⣿▒
+> ▒⢹⡇⣿⣿⣿⠄⣞⣯⣷⣾⣿⣿⣧⡹⡆⡀⠉⢹⡌⠐⢿⣿⣿⣿⡞⣿⣿⣿▒
+  ▒⣾⡇⣿⣿⡇⣾⣿⣿⣿⣿⣿⣿⣿⣿⣄⢻⣦⡀⠁⢸⡌⠻⣿⣿⣿⡽⣿⣿▒
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+painting while held · modified · brush: colour 1
+^X/esc close · ^C quit · ^S save · ^Z undo · ^Y redo
+space hold to paint · backspace hold to erase · b toggle painting · del toggle erasing · i pick col…
+F6 split · shift+F6 side by side · shift+arrows scroll · pgup/pgdn page · F5 redraw
 ```
+
+The swatches are blocks of their colour and `▒` is the grey border around the art; each hint line
+colours its actions, a colour per line, so a key and what it does are never run together.
 
 ## The picker, two ways
 
@@ -41,9 +48,11 @@ arterminal examples/skull.txt
 
 ## The binary's contract
 
-One argument: the file to edit. The picker draws on **stderr**; stdout carries nothing, because
-everything the session produces goes back into the file on `Ctrl+S`. Exit codes: `0` the picker
-ran, `2` the file or the terminal was unusable.
+One argument, the file to edit, and optionally `--su` — see
+[Holding through the input devices](#holding-through-the-input-devices). The picker draws on
+**stderr**; stdout carries nothing, because everything the session produces goes back into the
+file on `Ctrl+S`. Exit codes: `0` the picker ran, `2` the file or the terminal was unusable. Under
+`--su`, a sudo that refuses passes its own status through.
 
 ## The file
 
@@ -74,17 +83,115 @@ module so it can be changed.
 
 | Key | On a swatch | On `[+]` | On a cell |
 |---|---|---|---|
-| `↑` `↓` `←` `→` (Tab, Shift-Tab) | move | move | move |
-| `Space` / `Enter` | pick it as the brush | add a random colour | paint with the brush |
-| `Backspace` / `Delete` | — | — | erase |
+| `↑` `↓` `←` `→` (Tab, Shift-Tab) | move | move | move — painting or erasing the cells passed over while a pen is down |
+| `Shift` + arrows | scroll the window without moving the cursor |||
+| `PageUp` / `PageDown` | — | — | jump a screen up or down, painting nothing on the way |
+| `Space` / `Enter` | pick it as the brush | add a colour, then name it | **hold** to paint while moving; a tap paints one cell |
+| `Backspace` | (while naming: delete a character) | — | **hold** to erase while moving; a tap erases one cell |
+| `b` | — | — | **toggle** painting: the pen stays down until `b` again |
+| `Delete` | — | — | **toggle** erasing: the pen stays down until `Delete` again |
+| `i` | — | — | pick up the colour under the cursor as the brush |
+| `]` / `[` | grow / shrink the pen: a square from 1×1 up to the canvas's longer side |||
+| `F2` | re-roll the colour, then name it | — | — |
+| `F5` | clear the terminal and redraw everything |||
+| `F6` | split the art into a solid-colour canvas over a coloured preview, or join it back |||
+| `Shift+F6` | the same split, side by side, or join it back |||
+| `c` | in a split, show or hide the cursor on the preview |||
 | `Ctrl+S` | save to the file it was opened from |||
-| `Ctrl+Z` / `Ctrl+Y` | undo / redo |||
-| `Esc` / `Ctrl+X` | close — warns first if there is unsaved work, closes on the second press |||
-| `Ctrl+C` | close at once, unsaved or not |||
+| `Ctrl+Z` / `Ctrl+Y` | undo / redo — hold to keep going; a whole drag is one undo |||
+| `Ctrl+X` / `Esc` | close — warns first if there is unsaved work, closes on the second press |||
+| `Ctrl+C` | quit at once — unsaved work is kept in `<file>.arterminal.tmp` |||
 
-Redo is `Ctrl+Y` rather than `Ctrl+Shift+Z` because a classic terminal sends the same byte for
-both, so the two cannot be told apart. The cursor does not wrap: a canvas is a plane, and holding
-`↑` should stop at the top edge rather than teleport to the bottom one.
+**The hint lines** under the status row follow the cursor and say only what works right now: the
+file on the first line, colour on the second, the view on the third. On a short terminal the view
+line goes first, then the colour line, so the drawing keeps at least three rows; the way out is
+never dropped.
+
+**Hold keys and toggle keys.** Space, Enter and Backspace work while held and never latch: the
+pen is down exactly while the key is. Held together, the last one pressed is in charge, and letting
+it go hands the pen back to the one still down. `b` and `Delete` latch on one press and unlatch on
+the next. The toggles need nothing from the terminal, so they drag the same way everywhere.
+
+**The pen's size.** `]` grows the pen to 2×2, 3×3 and so on, up to the canvas's longer side, and
+`[` shrinks it back to 1×1. The square is centred on the cursor, leaning right and down when its
+size is even, and clipped at the edges. The cursor draws its whole footprint, so what the next
+press will cover is always visible, and a tap of a big pen is still a single undo.
+
+**Holding needs something that reports key releases.** A classic terminal reports only key
+*presses*: holding Space auto-repeats it, and letting go sends nothing. arterminal takes releases
+from the first of these that works:
+
+1. **The terminal**, through the kitty keyboard protocol, which arterminal asks for at startup.
+   kitty, WezTerm, foot, Ghostty and others speak it, and there is nothing to set up.
+2. **The input devices**, on Linux, when the terminal cannot report releases. The kernel knows
+   which keys are physically down, below X11, Wayland and the console alike. This needs read access
+   to `/dev/input`: run with `--su`, or join the `input` group — see
+   [Holding through the input devices](#holding-through-the-input-devices).
+3. **Neither**: a hold key paints or erases the one cell under the cursor, and a notice at startup
+   says so. The toggles still drag.
+
+The hint line says which behaviour this terminal gets, and the status row always shows whether the
+pen is down and what holds it. tmux passes the protocol's encoding but not its release events, so
+expect taps there. A pen whose release never arrives is caught at the next press of its key: it is
+lifted, the keys tap from then on, and the status row says why.
+
+**Scrolling.** A drawing bigger than the terminal scrolls, palette and all. The window follows the
+cursor and moves only as far as it must when the cursor reaches an edge, so the picture holds still
+while you draw inside it. `Shift` with an arrow moves the window on its own, which is how the split
+view's preview is seen; the next cursor move brings the window back. The status row says what is
+showing — `rows 5-40 of 200 · cols 1-60 of 78` — whenever some of it is not, and the status and
+hint rows stay at the bottom at every size.
+
+**Naming.** Adding a colour with `[+]`, or re-rolling one with `F2`, drops straight into naming it:
+the row shows the name being typed with a prompt in the swatch's own colour. Type, `Backspace` to
+fix, `Enter` to keep, `Esc` to leave it as it was. A name the palette will not take (a duplicate,
+or empty) is refused with a notice and left on screen to be corrected rather than thrown away.
+
+**The split view** shows the drawing twice: a canvas where every cell is a solid block of its
+colour — black where it has none — so coverage is easy to judge, and the art as it will really
+look. `F6` stacks them, `Shift+F6` puts them side by side, each in half the width. The cursor
+lives on the canvas; the preview is read-only, but marks the cursor's place with the canvas's own
+`+` on a filled cell, which `c` hides when it covers the glyph being judged.
+
+**The border** around the art is a solid band of grey. It is drawn as coloured spaces rather than
+box-drawing lines, which some terminals draw two columns wide, so with colour switched off it takes
+its cells but cannot be seen.
+
+Redo is `Ctrl+Y` rather than `Ctrl+Shift+Z`, because a classic terminal sends the same byte for
+both. The cursor does not wrap: a canvas is a plane, and holding `↑` stops at the top edge.
+
+### Holding through the input devices
+
+On Linux, `/dev/input/event*` is readable by root and the `input` group only. There are two ways
+in, and they trade against each other.
+
+**Per run: `--su`.** `arterminal --su art.txt` asks sudo for the keyboards for that run only. It
+explains itself before the password prompt, re-runs itself under sudo, opens the keyboards, and
+then becomes you again at once — groups, group and user, each checked, and verified afterwards so
+that root cannot be regained. The art file is read only after that, so `--su` never shows or saves
+a file you could not open yourself. sudo itself is taken from its system location, never from
+`PATH`, so a planted `sudo` cannot be the thing that asks for your password. A sudo ticket the run
+created is revoked when it ends; one you already had is left alone. Without a terminal to ask at, it goes ahead without held keys rather
+than block. sudo resets the environment, so settings such as `NO_COLOR` do not reach the session.
+
+**Standing: the `input` group.** Join it, then log out and back in, since membership is applied at
+login (`newgrp input` tries it in the current shell first):
+
+```sh
+sudo usermod -aG input "$USER"
+```
+
+**Know what the group grants.** Membership of `input` lets *any* program you run read *every*
+input device on the machine: full keylogging, passwords typed into any application included.
+arterminal uses a sliver of it. Beyond finding which devices are keyboards, it asks the kernel one
+question, "which keys are down right now?", at startup, on each key the terminal delivers, and
+while a stroke is held. It never reads the stream of keystrokes, so none of them pass through it,
+and since every stroke begins with the terminal's own key press, nothing pressed in another window
+can paint. The group knows none of that, and neither does anything else you run. If the trade is
+not worth holding Space, use `--su` instead, or skip both: the toggles drag without either.
+
+Over ssh, the devices belong to the machine arterminal runs on, not the keyboard being typed on.
+When no device ever shows the key behind a press, arterminal says so once and the keys tap.
 
 ## Layout
 
@@ -95,10 +202,13 @@ both, so the two cannot be told apart. The cursor does not wrap: a canvas is a p
 | `src/palette.rs` | `Palette`, `Swatch`, and derived swatches — the colours a drawing may use. |
 | `src/canvas.rs` | `Canvas`, `Cell`, and the text loader with its validation rules. |
 | `src/cursor.rs` | `Focus` and `Dir`: where the cursor is, and where a key sends it. |
+| `src/keys.rs` | Bytes from the terminal into key events — presses, repeats, releases. Pure. |
 | `src/document.rs` | The file format: art with inline colours, then the palette. Parse and render, pure. |
-| `src/ui.rs` | `Picker` — brush, edits, undo history, save — and `render`, `apply`, `run`. |
+| `src/ui.rs` | `Picker` — brush, pen, naming, undo history, save/salvage — and `render`, `apply`, `run`. |
 | `src/paint.rs` | Getting a frame onto the terminal without flicker. **Ported** — see below. |
-| `src/input.rs` | Raw mode, the blocking wait, and keystroke coalescing. **Ported.** |
+| `src/input.rs` | Raw mode, the waits and reads, keystroke coalescing (**ported**), and the keyboard-protocol guard. |
+| `src/devices.rs` | Key releases from `/dev/input`, for terminals that report none. Polls which keys are down; never reads keystrokes. |
+| `src/elevate.rs` | `--su`: sudo for one run, the keyboards opened, root given back and the drop verified. Linux only. |
 | `src/main.rs` | The standalone binary. |
 | `examples/skull.txt` | Sample art. |
 | `tests/stderr_gate.rs` | The one test that must write `console`'s process-wide colour switches, kept in its own process. |
@@ -119,14 +229,40 @@ that already owns its screen can call the first two itself and composite the res
 thing a key can ask for that needs a file, saving, comes out of `apply` as `Action::Save` for the
 caller to perform.
 
-**Ctrl+C is read as a key, not a signal.** `console`'s plain `read_key` answers Ctrl+C by raising
-`SIGINT` on the process — the terminal is raw, so nothing else would — and the default handler
-ends the process before the raw mode can be undone, leaving the shell raw with its cursor hidden.
-`run` uses `read_key_raw`, which hands Ctrl+C back as a keystroke to be closed on like any other.
+**Keys are decoded here, not by `console`.** Two defects forced it, and either alone would have.
+`console` has no notion of key releases, so "stop painting when Space is let go" could not be
+heard at all. And its reader takes an `ESC` plus at most three bytes, with no loop to a CSI final
+byte and no SS3 branch: every F-key splits into an unknown escape plus a stray typed character,
+every time. `keys.rs` scans to the real final byte, understands the kitty protocol, and waits for
+the rest of a sequence rather than tearing it — briefly for a lone `ESC`, which may be the Escape
+key, and generously for anything else unfinished, since no valid input ends there.
 
-**Undo carries a recolour with it.** The history records colours, not swatch names. When a swatch
-moves, every cell holding its old colour is rewritten and so is every history entry mentioning
-it — otherwise undoing an old paint would put a colour back on the canvas that no swatch owns.
+**Ctrl+C is a key, not a signal.** Raw mode turns signal generation off, so `Ctrl+C` arrives as the
+byte `0x03` and is decoded like any other chord. Nothing ever raises `SIGINT`, which is why the
+picker never needs a handler for it.
+
+**What the keyboard-protocol guard cannot cover.** The protocol's flags are pushed at startup and
+popped by a `Drop` guard, which runs on normal return and on panics — but not on
+`process::exit`, `abort`, or a signal such as `SIGTERM`. If the process is killed while running,
+the shell is left receiving every key as an escape sequence; closing the terminal tab recovers it.
+A signal handler would close that gap and is a known follow-up, not yet built.
+
+**Undo carries a recolour and a rename with it.** The history records colours and labels, not
+references. When a swatch moves, every cell holding its old colour is rewritten and so is every
+history entry mentioning it — otherwise undoing an old paint would put a colour back on the canvas
+that no swatch owns. A rename is carried into the history the same way, so undoing the `[+]` that
+made a swatch still finds it under the name it has now.
+
+**Ctrl+C salvages rather than argues.** An interrupt that stopped to ask about unsaved work would
+not be an interrupt; one that silently dropped the work would be worse. So `Ctrl+C` writes any
+unsaved state to `<file>.arterminal.tmp` — a real document that reopens — and leaves the original
+untouched. Nothing is written when there is nothing unsaved, or when the picker was built in code
+with no file behind it.
+
+**Function keys are reassembled, not trusted.** `console` has no notion of an F-key and splits the
+escape that spells one across two reads, leaving the tail to surface as a typed letter on the next.
+`Picker::decode` remembers the first half and completes it, recognising F1/F3/F4 only to swallow
+them so a stray `P`/`R`/`S` never lands in a name.
 
 **`paint` and `input` are ported** from the sibling project `terminal_choice` (commit `4f7a222`),
 which solved the flicker problem first. Both projects are GPL-3.0-only and share an owner. The
@@ -153,8 +289,9 @@ pty, and it stays found by the scan.
 **The frame never exceeds the terminal.** A frame taller than the screen scrolls, and `\x1b[nA`
 clamps at the top margin rather than un-scrolling — so the cursor arithmetic breaks permanently,
 not cosmetically. `paint::height_budget` is one row shorter than the terminal because every line
-ends with a newline, the last one included. Neither limit is silent: a canvas too tall ends in a
-count of the dropped rows, and a line too wide ends in `…`.
+ends with a newline, the last one included. Neither limit is silent: art that does not fit scrolls,
+with the status row saying which rows and columns are showing, and any other line too wide ends in
+`…`.
 
 **Compose style attributes; never concatenate escape strings.** A rendered string contains its
 own `\x1b[0m`, and a reset inside a hand-rolled reverse-video wrapper ends the inversion partway
@@ -190,13 +327,15 @@ Plain-text art loads with no ink anywhere.
 
 ## Not yet built
 
-* **A scrolling viewport.** Today a canvas taller than the terminal is clipped with a marker.
-* **A colour editor.** Swatches are random from `[+]`; `Picker::set_swatch_color` exists and is
-  tested, but no key reaches it. When one does, it must commit only if the user actually moved
-  something — an editor that wrote back on every close would round-trip the colour through HSB
-  for nothing and, because recolouring rewrites the matrix, dirty the whole drawing on a no-op.
+* **A real colour editor.** `F2` re-rolls a swatch to a *random* free colour — a stub over the
+  finished `Picker::set_swatch_color`. A proper picker (hue/saturation/brightness, the reason
+  `Hsb` exists) is the next step, and it must commit only if the user actually moved something:
+  because recolouring rewrites the matrix, an editor that wrote back on every close would dirty
+  the whole drawing on a no-op.
 * **Derived swatches in the UI.** The palette and the file support them; nothing creates one yet.
-* **Recolouring in the undo history.** A swatch's move rewrites the history but is not itself an
-  entry in it.
 * **Removing a swatch by hand.** Only undo removes one today.
+* **A signal handler** restoring raw mode and the keyboard flags on `SIGTERM` — see above.
+* **The alternate screen.** The picker draws inline, below the shell prompt, so a resize reflows
+  its old frames into the scrollback; `F5` repairs the damage by hand. Drawing on the terminal's
+  alternate screen, as full-screen programs do, would remove the cause.
 * **A warning when a file with very many colours is loaded**, since each becomes a swatch.

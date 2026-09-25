@@ -1,4 +1,11 @@
 
+handle color-definition in creation and in F2
+
+color compression?
+
+
+
+
 Create braille pic generator, with adaptive sizing (input: image, then various size specifications; output: braille image)
 
 Create edges-adaptive ascii-art maker - find sharp transitions (do FFT and preserve the high-frequency waves?) and with adaptive sizing, fit chars from a large char-pool, so that the pixels in the chars roughly align with the image's (post edge-detection) pixels on that tile

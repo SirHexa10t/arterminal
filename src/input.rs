@@ -82,21 +82,130 @@ impl Drop for RawMode {
     }
 }
 
-/// Sleep until the terminal has input (or is gone). `Ok(true)`: a key is waiting, and
-/// `Term::read_key` will return without ever reaching its zero-timeout polling. `Ok(false)`:
-/// hangup — the terminal went away, which a caller should read as closing rather than spin on
-/// (a hung-up fd stays "ready" forever without ever having input).
+/// What a bounded wait on the terminal found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Readiness {
+    /// Bytes are waiting to be read.
+    Ready,
+    /// The time ran out with nothing to read.
+    TimedOut,
+    /// The terminal went away — which a caller should read as closing rather than spin on (a
+    /// hung-up fd stays "ready" for ever without ever having input).
+    HungUp,
+}
+
+/// The kitty keyboard protocol, turned on for the whole run and off again on drop — the only way
+/// a terminal will say a key was RELEASED. See [`crate::keys`].
 ///
-/// This is THE idle state of a running picker, so it is a plain blocking `poll` owned here:
-/// whether an idle picker costs 0% CPU should not depend on a dependency's key-reading
-/// internals. It only works because [`RawMode`] holds the terminal non-canonical — cooked mode
-/// releases bytes to `poll` a full line at a time.
-pub(crate) fn await_input(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+/// Declared after [`RawMode`] wherever both are held, so it drops first and the flags come off
+/// while the terminal is still raw.
+///
+/// WHAT DROP DOES NOT COVER, stated exactly rather than as "every path": `Drop` runs on scope exit
+/// and on unwinding panics. It does NOT run on `std::process::exit`, `abort`, or a signal —
+/// SIGTERM from `kill`, SIGHUP when the window closes. The first two do not occur while a picker
+/// runs today (the binary's `fail` exits only after `run` has returned); the signals can. That
+/// exposure is not new — [`RawMode`] has it too — but the consequence is worse here: flag 8 makes
+/// EVERY key an escape sequence, so a shell left with the flags pushed cannot even be typed into
+/// well enough to run `reset`. A handler that writes the pop (`write(2)` is async-signal-safe) and
+/// re-raises would close it; it is deliberately a separate decision, not built yet.
+pub(crate) struct KeyboardProtocol;
+
+impl KeyboardProtocol {
+    /// The flags asked for: disambiguate (1), event types (2), every key as an escape (8), and the
+    /// text each key produced (16).
+    ///
+    /// Flag 8 is required for releases of the keys this program holds, by TWO rules of the spec
+    /// that are worth citing separately, because only one of them names Space: Enter, Tab and
+    /// Backspace "will not have release events unless Report all keys as escape codes is also
+    /// set" (stated outright); and a key that produces text — Space — is "reported as plain UTF-8
+    /// text", with no event structure for a release to live in, unless flag 8 turns it into an
+    /// escape (the general rule). Flag 8 withholds typed text in exchange, which 16 puts back so
+    /// names can still be typed. Flag 4, alternate keys, is not needed and not asked for.
+    const FLAGS: u32 = 1 | 2 | 8 | 16;
+
+    /// Ask whether the terminal speaks the protocol and, if it does, turn it on.
+    ///
+    /// Returns the guard and whether releases will really arrive: a terminal can answer the query
+    /// and still decline some flags, so after pushing them it is asked again. Keys typed while
+    /// this runs are not lost — they are decoded into `backlog` for the caller to replay.
+    pub(crate) fn engage(
+        fd: std::os::fd::RawFd,
+        decoder: &mut crate::keys::Decoder,
+        backlog: &mut Vec<crate::keys::KeyEvent>,
+    ) -> std::io::Result<Option<(Self, bool)>> {
+        if query_flags(fd, decoder, backlog)?.is_none() {
+            return Ok(None);
+        }
+        write_to_terminal(&format!("\x1b[>{}u", Self::FLAGS))?;
+        let guard = Self;
+        let granted = query_flags(fd, decoder, backlog)?.unwrap_or(0);
+        Ok(Some((guard, granted & 0b1010 == 0b1010)))
+    }
+}
+
+impl Drop for KeyboardProtocol {
+    fn drop(&mut self) {
+        let _ = write_to_terminal("\x1b[<u");
+    }
+}
+
+/// How long to wait for a terminal to answer the device-attributes query. Every real terminal
+/// answers within milliseconds locally; the margin is for ssh. One that never answers is treated
+/// as not speaking the protocol, which costs nothing but hold-to-paint.
+const QUERY_TIMEOUT_MS: i32 = 500;
+
+/// `CSI ? u` then `CSI c`, per the spec's detection recipe: a flags reply before the attributes
+/// reply means the protocol is spoken; the attributes reply alone means it is not.
+fn query_flags(
+    fd: std::os::fd::RawFd,
+    decoder: &mut crate::keys::Decoder,
+    backlog: &mut Vec<crate::keys::KeyEvent>,
+) -> std::io::Result<Option<u32>> {
+    use crate::keys::Decoded;
+    write_to_terminal("\x1b[?u\x1b[c")?;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(QUERY_TIMEOUT_MS as u64);
+    let mut flags = None;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+        if left == 0 || wait_for_input(fd, left)? != Readiness::Ready {
+            return Ok(flags);
+        }
+        for decoded in decoder.feed(&read_available(fd)?) {
+            match decoded {
+                Decoded::KeyboardFlags(value) => flags = Some(value),
+                Decoded::DeviceAttributes => return Ok(flags),
+                Decoded::Key(key) => backlog.push(key),
+            }
+        }
+    }
+}
+
+/// A control sequence to the terminal, flushed at once. Stderr, because that is where the picker
+/// draws and so the stream that reaches the terminal it is talking to.
+fn write_to_terminal(sequence: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    err.write_all(sequence.as_bytes())?;
+    err.flush()
+}
+
+/// Sleep until the terminal has input, is gone, or `timeout_ms` passes — negative for no limit.
+///
+/// Unbounded, this is THE idle state of a running picker, so it is a plain blocking `poll` owned
+/// here: whether an idle picker costs 0% CPU should not depend on a dependency's internals. It
+/// only works because [`RawMode`] holds the terminal non-canonical — cooked mode releases bytes
+/// to `poll` a full line at a time. Bounded, it is how a lone `ESC` is told apart from the start
+/// of a longer sequence: see [`ESCAPE_TIMEOUT_MS`].
+pub(crate) fn wait_for_input(
+    fd: std::os::fd::RawFd,
+    timeout_ms: i32,
+) -> std::io::Result<Readiness> {
     let mut watch = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     loop {
         // SAFETY: `poll` reads and writes only the pollfd handed to it, which lives on this
-        // stack frame; a negative timeout blocks until the fd has news.
-        let ready = unsafe { libc::poll(&mut watch, 1, -1) };
+        // stack frame.
+        let ready = unsafe { libc::poll(&mut watch, 1, timeout_ms) };
         if ready < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -104,12 +213,49 @@ pub(crate) fn await_input(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
             }
             return Err(err);
         }
+        if ready == 0 {
+            return Ok(Readiness::TimedOut);
+        }
         if watch.revents & libc::POLLIN != 0 {
-            return Ok(true);
+            return Ok(Readiness::Ready);
         }
         if watch.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Ok(false);
+            return Ok(Readiness::HungUp);
         }
+    }
+}
+
+/// How long to wait for the rest of an escape sequence before deciding a lone `ESC` was the
+/// Escape key.
+///
+/// A terminal writes a whole sequence at once, so its bytes arrive within microseconds on a local
+/// machine; the margin is for ssh, where a sequence can straddle two packets. 25 ms is well under
+/// what a person perceives as lag on the Escape key and well over one network hop on a sane link.
+/// Too short and an arrow over a slow link turns into an Escape; too long and closing feels sticky.
+pub(crate) const ESCAPE_TIMEOUT_MS: i32 = 25;
+
+/// How long to wait for the rest of a sequence that is PROVABLY unfinished — an `ESC [` or `ESC O`
+/// introducer held, a UTF-8 character split across reads. No valid input ends there, so this is
+/// not a latency bet the way [`ESCAPE_TIMEOUT_MS`] is: it only bounds how long a link can stall
+/// mid-sequence before the fragment is dropped rather than held for ever. Generous on purpose —
+/// cutting it short is the exact tear the decoder exists to prevent.
+pub(crate) const SEQUENCE_TIMEOUT_MS: i32 = 500;
+
+/// Whatever the terminal has sent, up to what one read returns. Empty means the fd closed.
+pub(crate) fn read_available(fd: std::os::fd::RawFd) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: `read` writes at most `buf.len()` bytes into `buf`, which lives here.
+        let got = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if got < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        buf.truncate(got as usize);
+        return Ok(buf);
     }
 }
 

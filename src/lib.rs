@@ -42,13 +42,13 @@
 //! testable without a terminal.
 //!
 //! ```
-//! use arterminal::{Canvas, Focus, Key, Picker};
+//! use arterminal::{Canvas, Focus, KeyCode, Picker};
 //! use arterminal::ui::{apply, render, Action};
 //!
 //! let mut picker = Picker::new(Canvas::from_text("ab\ncd")?);
 //! assert_eq!(picker.focus(), Focus::Add, "no swatches yet, so the cursor starts on [+]");
 //!
-//! assert_eq!(apply(&mut picker, Key::Enter), Action::Redraw);
+//! assert_eq!(apply(&mut picker, KeyCode::Enter), Action::Redraw);
 //! assert_eq!(picker.palette().len(), 1, "enter on [+] added a colour");
 //!
 //! let lines = render(&picker, 40, 12);
@@ -67,19 +67,20 @@ pub mod canvas;
 pub mod color;
 pub mod cursor;
 pub mod document;
+pub mod elevate;
+pub mod keys;
 pub mod palette;
 pub mod ui;
 
+mod devices;
 mod input;
 mod paint;
-
-/// Re-exported from `console`, because [`ui::apply`] takes one: an embedder should be able to
-/// name every type in this crate's signatures without adding a dependency of its own.
-pub use console::Key;
 
 pub use crate::canvas::{At, Canvas, CanvasError, Cell, LoadCause, LoadError};
 pub use crate::color::{ColorParseError, Hsb, Rgb, Rng};
 pub use crate::cursor::{Dir, Focus};
+pub use crate::devices::InputDevices;
 pub use crate::document::{Document, DocumentError};
+pub use crate::keys::{KeyCode, KeyEvent, KeyKind, Mods};
 pub use crate::palette::{Derivation, HsbOffset, Palette, PaletteError, Recolour, Swatch};
-pub use crate::ui::{run, Action, Outcome, Picker};
+pub use crate::ui::{run, run_with_devices, Action, Outcome, Picker};
