@@ -286,6 +286,7 @@ const DOTS: &str = "......\n......\n......\n";
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 const RIGHT: &[u8] = b"\x1b[C";
+const PAGE_UP: &[u8] = b"\x1b[5~";
 
 /// A classic terminal reports presses only: Space taps one cell, `b` drags, and Ctrl+C keeps the
 /// unsaved work beside the file — and the terminal comes back exactly as it was lent.
@@ -295,10 +296,10 @@ fn a_classic_terminal_taps_toggles_and_salvages_on_ctrl_c() {
     let mut session = Session::start(&[path.clone().into()], Terminal::Classic, true);
     session.expect("^X/esc close");
     session.expect("run with --su");
-    // [+] adds a colour and asks its name; Enter keeps it as offered. (Not Esc: a lone Esc is
-    // only Esc once the decoder's timeout has passed, and this file never waits on a clock.) Then
-    // pick it as the brush, and go down to (0,0).
-    session.keys(&[b"\r", b"\r", UP, b" ", DOWN, DOWN]);
+    // [+] opens the colour dial; Enter keeps the colour it offers and asks its name; Enter keeps
+    // that as offered too. (Not Esc: a lone Esc is only Esc once the decoder's timeout has passed,
+    // and this file never waits on a clock.) Then pick it as the brush, and go down to (0,0).
+    session.keys(&[b"\r", b"\r", b"\r", UP, b" ", DOWN, DOWN]);
     session.keys(&[b" ", RIGHT, b"b", RIGHT, RIGHT, b"b", RIGHT]);
     session.keys(&[b"\x03"]);
     let (status, settings) = session.finish();
@@ -318,7 +319,9 @@ fn a_kitty_terminal_holds_keys_saves_and_pops_its_flags() {
     let mut session = Session::start(&[path.clone().into()], Terminal::Kitty, true);
     session.expect("^X/esc close");
     assert!(contains(&session.out, b"\x1b[>27u"), "the protocol was asked for");
-    session.keys(&[b"\x1b[13u", b"\x1b[27u", UP, b"\x1b[32u", b"\x1b[32;1:3u", DOWN, DOWN]);
+    // [+]: the dial, its colour kept, and its name as offered — Esc there gives up only renaming.
+    session.keys(&[b"\x1b[13u", b"\x1b[13u", b"\x1b[27u"]);
+    session.keys(&[UP, b"\x1b[32u", b"\x1b[32;1:3u", DOWN, DOWN]);
     session.keys(&[b"\x1b[32u", RIGHT, RIGHT, b"\x1b[32;1:3u", RIGHT]);
     session.keys(&[b"\x1b[122;5u", b"\x1b[122;6u"]); // undo, then ctrl+shift+z redoes it
     session.keys(&[b"\x1b[115;5u"]); // ctrl+s
@@ -398,6 +401,30 @@ fn slot_colours_open_as_slot_swatches_and_save_back_as_slots() {
         "the slot, spelled as drawn: {saved:?}"
     );
     assert!(saved.contains("colour 1\tslot 196\n"), "and its swatch, as a slot: {saved:?}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The colour dial, end to end: F2 opens it on the swatch's colour, Page Up turns the hue ten
+/// degrees a press, Enter keeps the colour — the drawing recoloured with it — and Ctrl+S writes
+/// what was kept.
+#[test]
+fn the_dial_recolours_a_swatch_and_the_drawing_with_it() {
+    let (dir, path) = scratch("dial", "\x1b[38;2;255;0;0mab\x1b[0m..\n");
+    let mut session = Session::start(&[path.clone().into()], Terminal::Kitty, true);
+    session.expect("^X/esc close");
+    session.keys(&[b"\x1bOQ"]); // F2, on the red swatch the cursor starts on
+    session.expect("H:   0 ; S: 100 ; B: 100");
+    session.keys(&[PAGE_UP; 12]);
+    session.expect("H: 120 ; S: 100 ; B: 100");
+    session.keys(&[b"\x1b[13u", b"\x1b[13u"]); // keep the colour, then the name
+    session.keys(&[b"\x1b[115;5u"]); // ctrl+s
+    session.expect("saved to");
+    session.keys(&[b"\x1b[27u"]);
+    let (status, _) = session.finish();
+    assert!(status.success(), "exit {status}");
+    let saved = std::fs::read_to_string(&path).expect("readable");
+    assert!(saved.starts_with("\x1b[38;2;0;255;0mab\x1b[0m..\n"), "green now: {saved:?}");
+    assert!(saved.contains("colour 1\t#00ff00\n"), "and so is its swatch: {saved:?}");
     std::fs::remove_dir_all(dir).ok();
 }
 

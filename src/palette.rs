@@ -207,11 +207,37 @@ impl Palette {
         label: &str,
         color: impl Into<Ink>,
     ) -> Result<Recolour, PaletteError> {
+        let proposed = self.proposal(label, color.into())?;
+        let recolour = self.changes_to(&proposed);
+        for (swatch, now) in self.swatches.iter_mut().zip(proposed) {
+            swatch.color = now;
+        }
+        Ok(recolour)
+    }
+
+    /// What [`Palette::set_color`] would do, without doing it: the same `(was, now)` pairs, or
+    /// the same refusal, and the palette untouched either way.
+    ///
+    /// For asking before moving — a colour editor saying whether the colour under its dial could
+    /// be kept, while it is still being turned. Asked of the rule itself rather than of a
+    /// look-up like [`Palette::holder_of`], because only the rule knows that a swatch never
+    /// blocks itself, and that what follows it moves too and can collide on its own.
+    pub fn color_change(
+        &self,
+        label: &str,
+        color: impl Into<Ink>,
+    ) -> Result<Recolour, PaletteError> {
+        Ok(self.changes_to(&self.proposal(label, color.into())?))
+    }
+
+    /// Every swatch's colour once `label` has moved to `color`, in palette order — or why the
+    /// move is refused. See [`Palette::set_color`].
+    fn proposal(&self, label: &str, color: Ink) -> Result<Vec<Ink>, PaletteError> {
         let Some(at) = self.position(label) else {
             return Err(PaletteError::UnknownLabel { label: label.to_string() });
         };
         let mut proposed: Vec<Ink> = self.swatches.iter().map(Swatch::color).collect();
-        proposed[at] = color.into();
+        proposed[at] = color;
         self.resolve_from(at, &mut proposed)?;
 
         // Checked against the WHOLE proposal rather than against the palette as it stands: two
@@ -220,25 +246,31 @@ impl Palette {
         for (left, colour) in proposed.iter().enumerate() {
             if let Some(right) = proposed.iter().position(|other| other == colour) {
                 if right != left {
+                    // Named: the swatch already there, which this move leaves where it is — not
+                    // whichever of the two comes first, which is as often the one being moved onto
+                    // it. Two followers pushed onto each other are both new there, and either
+                    // names the collision.
+                    let blocker = if self.swatches[right].color == *colour { right } else { left };
                     return Err(PaletteError::DuplicateColor {
                         color: *colour,
-                        held_by: self.swatches[right.min(left)].label.clone(),
+                        held_by: self.swatches[blocker].label.clone(),
                     });
                 }
             }
         }
+        Ok(proposed)
+    }
 
+    /// The `(was, now)` pairs between the palette as it stands and `proposed`.
+    fn changes_to(&self, proposed: &[Ink]) -> Recolour {
         let changes = self
             .swatches
             .iter()
-            .zip(&proposed)
+            .zip(proposed)
             .filter(|(swatch, now)| swatch.color != **now)
             .map(|(swatch, now)| (swatch.color, *now))
             .collect();
-        for (swatch, now) in self.swatches.iter_mut().zip(proposed) {
-            swatch.color = now;
-        }
-        Ok(Recolour { changes })
+        Recolour { changes }
     }
 
     /// Give a swatch a different name, and point everything that followed it at the new one.
@@ -601,7 +633,8 @@ mod tests {
         let before = palette.clone();
         assert_eq!(
             palette.set_color("ember", BLUE),
-            Err(PaletteError::DuplicateColor { color: BLUE.into(), held_by: "ember".into() })
+            Err(PaletteError::DuplicateColor { color: BLUE.into(), held_by: "sky".into() }),
+            "named: the swatch holding blue, not the one being moved onto it"
         );
         assert_eq!(palette, before, "nothing moved");
     }
@@ -619,11 +652,39 @@ mod tests {
         palette.push("occupied", landing).expect("free for now");
         let before = palette.clone();
 
-        assert!(matches!(
+        assert_eq!(
             palette.set_color("base", BLUE),
-            Err(PaletteError::DuplicateColor { .. })
-        ));
+            Err(PaletteError::DuplicateColor { color: landing.into(), held_by: "occupied".into() }),
+            "named: the swatch that was there, not the follower pushed onto it"
+        );
         assert_eq!(palette, before, "the base did not move either");
+    }
+
+    /// Asking first gets the answer the move itself would give — the same pairs, the same
+    /// refusal — and moves nothing. Including the two answers a look-up by colour gets wrong: a
+    /// swatch never blocks ITSELF, and a follower can block a move on its own.
+    #[test]
+    fn asking_about_a_move_answers_as_the_move_would_and_moves_nothing() {
+        let darker = HsbOffset { brightness: -60, ..HsbOffset::default() };
+        let mut palette = palette(&[("base", RED), ("sky", BLUE)]);
+        palette.push_derived("shade", "base", darker).expect("base exists");
+        let landing = Rgb::from_hsb(darker.apply(Rgb::new(0, 200, 0).to_hsb()));
+        palette.push("occupied", landing).expect("free for now");
+        let before = palette.clone();
+        let cases = [
+            ("base", Rgb::new(250, 250, 0), true, "a free colour"),
+            ("base", RED, true, "its own colour"),
+            ("base", BLUE, false, "another swatch's colour"),
+            ("base", Rgb::new(0, 200, 0), false, "a colour that pushes its follower onto a third"),
+            ("nobody", RED, false, "a swatch that is not here"),
+        ];
+        for (label, colour, allowed, case) in cases {
+            let asked = palette.color_change(label, colour);
+            assert_eq!(palette, before, "{case}: asking moved nothing");
+            assert_eq!(asked.is_ok(), allowed, "{case}: {asked:?}");
+            assert_eq!(asked, before.clone().set_color(label, colour), "{case}: the same answer");
+        }
+        assert!(palette.color_change("base", RED).unwrap().is_empty(), "no change to itself");
     }
 
     #[test]

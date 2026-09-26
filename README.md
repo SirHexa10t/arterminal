@@ -76,9 +76,10 @@ shade<TAB>#a02020<TAB>ember<TAB>0,0,-60
   rather than colours, so they load as slot swatches, tagged `slot 196` in the palette — the first
   16 as `slot 3 (theme)`, since only those follow the theme — and are drawn and saved as the slot
   they are. A slot is written as `ESC[38;5;n m`, the spelling the picker draws it in, and a slot
-  swatch as `label<TAB>slot 196`. New swatches, from `[+]` or `F2`, are always 24-bit; `F2` on a
-  slot swatch makes it one, and says so. A swatch cannot follow a slot, since what a slot looks
-  like is the terminal's to say.
+  swatch as `label<TAB>slot 196`. The colour dial makes 24-bit colours only, so a new swatch is
+  always one, and a colour kept from `F2` makes a slot swatch one too, and says so; kept unchanged,
+  a slot stays a slot. A swatch cannot follow a slot, since what a slot looks like is the
+  terminal's to say.
 * **A file with colours but no palette still loads**: every colour found gets a swatch with a
   counted name, because every colour in a drawing must have one.
 * **Rows are trimmed of trailing spaces on save**, so a ragged drawing stays ragged.
@@ -100,13 +101,13 @@ module so it can be changed.
 | `↑` `↓` `←` `→` (Tab, Shift-Tab) | move | move | move — painting or erasing the cells passed over while a pen is down |
 | `Shift` + arrows | scroll the window without moving the cursor |||
 | `PageUp` / `PageDown` | — | — | jump a screen up or down, painting nothing on the way |
-| `Space` / `Enter` | pick it as the brush | add a colour, then name it | **hold** to paint while moving; a tap paints one cell |
+| `Space` / `Enter` | pick it as the brush | choose a colour on the dial, then name it | **hold** to paint while moving; a tap paints one cell |
 | `Backspace` | (while naming: delete a character) | — | **hold** to erase while moving; a tap erases one cell |
 | `b` | — | — | **toggle** painting: the pen stays down until `b` again |
 | `Delete` | — | — | **toggle** erasing: the pen stays down until `Delete` again |
 | `i` | — | — | pick up the colour under the cursor as the brush |
 | `]` / `[` | grow / shrink the pen: a square from 1×1 up to the canvas's longer side |||
-| `F2` | re-roll the colour, then name it | — | — |
+| `F2` | choose a new colour on the dial, then rename it | — | — |
 | `F5` | clear the terminal and redraw everything |||
 | `F6` | split the art into a solid-colour canvas over a coloured preview, or join it back |||
 | `Shift+F6` | the same split, side by side, or join it back |||
@@ -162,8 +163,28 @@ view's preview is seen; the next cursor move brings the window back. The status 
 showing — `rows 5-40 of 200 · cols 1-60 of 78` — whenever some of it is not, and the status and
 hint rows stay at the bottom at every size.
 
-**Naming.** Adding a colour with `[+]`, or re-rolling one with `F2`, drops straight into naming it:
-the row shows the name being typed with a prompt in the swatch's own colour. Type, `Backspace` to
+**The colour dial.** `[+]` and `F2` open a dial where the swatch's row is, or will be — on a
+random colour nothing holds for a new swatch, on the swatch's own colour for `F2`:
+
+```
+                       ^
+> ███     H:  16 ; S:  85 ; B:  89  #e25822
+                       v
+```
+
+`←` `→` choose hue, saturation or brightness, and the `^` `v` point at the one chosen. `↑` `↓`
+turn it a degree or a percent, `PageUp` `PageDown` ten, and holding keeps turning. Beside the dial,
+on black so that nothing behind them interferes, three strips show each range from its top
+(highest) to its bottom, with a `<` at the value: the hue strip is always the pure wheel, and
+saturation and brightness are slices through the colour as it is. A value that turning would not
+change right now — the hue of a grey, the saturation of black — is dim. While `F2`'s dial is
+turned, the drawing shows the new colour, but nothing changes until `Enter` keeps it and goes on to
+naming; `Esc` gives it up. A colour another swatch holds can be dialled past but not kept, and the
+status row says whose it is. A dial turned and turned back is no change: the colour comes back to
+the bit, so nothing is recoloured and the file stays clean.
+
+**Naming.** Keeping a colour on the dial, for `[+]` or `F2`, drops straight into naming it: the
+row shows the name being typed with a prompt in the swatch's own colour. Type, `Backspace` to
 fix, `Enter` to keep, `Esc` to leave it as it was. A name the palette will not take (a duplicate,
 or empty) is refused with a notice and left on screen to be corrected rather than thrown away.
 
@@ -226,6 +247,7 @@ When no device ever shows the key behind a press, arterminal says so once and th
 | `src/palette.rs` | `Palette`, `Swatch`, and derived swatches — the colours a drawing may use. |
 | `src/canvas.rs` | `Canvas`, `Cell`, and the text loader with its validation rules. |
 | `src/cursor.rs` | `Focus` and `Dir`: where the cursor is, and where a key sends it. |
+| `src/dial.rs` | `Dial`: a colour chosen by hue, saturation and brightness, a step at a time. Pure. |
 | `src/keys.rs` | Bytes from the terminal into key events — presses, repeats, releases. Pure. |
 | `src/document.rs` | The file format: art with inline colours, then the palette. Parse and render, pure. |
 | `src/ui.rs` | `Picker` — brush, pen, naming, undo history, save/salvage — and `render`, `apply`, `run`. |
@@ -236,7 +258,8 @@ When no device ever shows the key behind a press, arterminal says so once and th
 | `src/main.rs` | The standalone binary. |
 | `examples/skull.txt` | Sample art. |
 | `tests/stderr_gate.rs` | The one test that must write `console`'s process-wide colour switches, kept in its own process. |
-| `tests/pty.rs` | The real binary on a pseudo-terminal, with the test playing the terminal: holding, saving, salvage, `--su` without a terminal, the startup questions, width measuring. |
+| `tests/no_colour.rs` | The picker with styling switched off — the dial draws no strips — in a process of its own for the same reason. |
+| `tests/pty.rs` | The real binary on a pseudo-terminal, with the test playing the terminal: holding, saving, salvage, `--su` without a terminal, the startup questions, width measuring, the colour dial. |
 | `*_img_test.txt` | Sample art at two sizes. |
 
 ## Design notes
@@ -368,11 +391,6 @@ Plain-text art loads with no ink anywhere.
 
 ## Not yet built
 
-* **A real colour editor.** `F2` re-rolls a swatch to a *random* free colour — a stub over the
-  finished `Picker::set_swatch_color`. A proper picker (hue/saturation/brightness, the reason
-  `Hsb` exists) is the next step, and it must commit only if the user actually moved something:
-  because recolouring rewrites the matrix, an editor that wrote back on every close would dirty
-  the whole drawing on a no-op.
 * **Derived swatches in the UI.** The palette and the file support them; nothing creates one yet.
 * **Removing a swatch by hand.** Only undo removes one today.
 * **A signal handler** restoring raw mode and the keyboard flags on `SIGTERM` — see above.

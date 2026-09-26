@@ -49,7 +49,10 @@
 //! assert_eq!(picker.focus(), Focus::Add, "no swatches yet, so the cursor starts on [+]");
 //!
 //! assert_eq!(apply(&mut picker, KeyCode::Enter), Action::Redraw);
-//! assert_eq!(picker.palette().len(), 1, "enter on [+] added a colour");
+//! assert!(picker.dial().is_some(), "enter on [+] opened the colour dial");
+//! apply(&mut picker, KeyCode::Up); // a degree round the wheel
+//! apply(&mut picker, KeyCode::Enter);
+//! assert_eq!(picker.palette().len(), 1, "and enter there added the colour");
 //!
 //! let lines = render(&picker, 40, 12);
 //! assert!(lines.iter().any(|line| line.contains("[+]")));
@@ -68,6 +71,7 @@
 pub mod canvas;
 pub mod color;
 pub mod cursor;
+pub mod dial;
 pub mod document;
 pub mod elevate;
 pub mod keys;
@@ -82,6 +86,7 @@ pub use crate::canvas::{At, Canvas, CanvasError, Cell, LoadCause, LoadError};
 pub use crate::color::{ColorParseError, Hsb, Ink, Rgb, Rng};
 pub use crate::cursor::{Dir, Focus};
 pub use crate::devices::InputDevices;
+pub use crate::dial::{Channel, Dial};
 pub use crate::document::{Document, DocumentError};
 pub use crate::keys::{KeyCode, KeyEvent, KeyKind, Mods};
 pub use crate::palette::{Derivation, HsbOffset, Palette, PaletteError, Recolour, Swatch};
