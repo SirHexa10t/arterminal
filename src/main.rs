@@ -32,8 +32,9 @@ Keys: ^X/esc close (twice if unsaved) · ^C quit, unsaved work kept in ART.txt.a
       F6 split into canvas and art · shift+F6 side by side · c art cursor in the split
       shift+arrows scroll a picture bigger than the window · page up/down jump a screen
       F5 redraw
-      on the colour dial ([+], F2): ←→ pick H, S or B · ↑↓ turn it · page up/down by 10
-      enter keep the colour, then name it · esc give it up
+      on the colour dial ([+], F2): ←→ or tab pick H, S or B · ↑↓ turn it · page up/down by 10
+      0-9 type the value · # and six hex digits type a colour · backspace takes a digit back
+      space/enter keep the colour, then name it — one undo with the name · esc give it up
 
 Holding a key needs its release reported. Terminals that speak the kitty keyboard protocol report
 it (kitty, WezTerm, foot, Ghostty, …). Elsewhere, on Linux, the input devices can — for root and

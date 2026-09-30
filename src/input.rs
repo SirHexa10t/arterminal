@@ -332,11 +332,11 @@ pub(crate) fn read_available(fd: std::os::fd::RawFd) -> std::io::Result<Vec<u8>>
 
 /// Whether a keystroke is ALREADY waiting to be read — asked, not waited on.
 ///
-/// The same `poll` as [`await_input`] with a zero timeout, which is the whole difference: that
+/// The same `poll` as [`wait_for_input`] with a zero timeout, which is the whole difference: that
 /// one blocks until there is news, this one reports whether there is any right now.
 pub(crate) fn input_pending(fd: std::os::fd::RawFd) -> bool {
     let mut watch = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    // SAFETY: as `await_input` — `poll` touches only the pollfd on this stack frame. A zero
+    // SAFETY: as `wait_for_input` — `poll` touches only the pollfd on this stack frame. A zero
     // timeout cannot block.
     unsafe { libc::poll(&mut watch, 1, 0) > 0 && watch.revents & libc::POLLIN != 0 }
 }

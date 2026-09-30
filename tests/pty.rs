@@ -428,6 +428,27 @@ fn the_dial_recolours_a_swatch_and_the_drawing_with_it() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// A colour typed on the dial, end to end: F2, then `#` and six hex digits typed as a terminal
+/// sends them, and Ctrl+S writes exactly that colour — no trip through hue and back.
+#[test]
+fn a_colour_typed_in_hex_is_saved_exactly() {
+    let (dir, path) = scratch("hex", "\x1b[38;2;255;0;0mab\x1b[0m..\n");
+    let mut session = Session::start(&[path.clone().into()], Terminal::Kitty, true);
+    session.expect("^X/esc close");
+    session.keys(&[b"\x1bOQ", b"#", b"4", b"b", b"0", b"0", b"8", b"2"]); // F2, then #4b0082
+    session.expect("#4b0082");
+    session.keys(&[b"\x1b[13u", b"\x1b[13u"]); // keep the colour, then the name
+    session.keys(&[b"\x1b[115;5u"]); // ctrl+s
+    session.expect("saved to");
+    session.keys(&[b"\x1b[27u"]);
+    let (status, _) = session.finish();
+    assert!(status.success(), "exit {status}");
+    let saved = std::fs::read_to_string(&path).expect("readable");
+    assert!(saved.starts_with("\x1b[38;2;75;0;130mab\x1b[0m..\n"), "indigo, exactly: {saved:?}");
+    assert!(saved.contains("colour 1\t#4b0082\n"), "and its swatch: {saved:?}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// A terminal that draws East Asian Ambiguous characters wide is asked, not guessed at: the
 /// probe's `·` is drawn and erased again, and every line of the frame then fits the terminal as
 /// IT measures them — the `·` between hints two columns each.

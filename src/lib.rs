@@ -86,7 +86,7 @@ pub use crate::canvas::{At, Canvas, CanvasError, Cell, LoadCause, LoadError};
 pub use crate::color::{ColorParseError, Hsb, Ink, Rgb, Rng};
 pub use crate::cursor::{Dir, Focus};
 pub use crate::devices::InputDevices;
-pub use crate::dial::{Channel, Dial};
+pub use crate::dial::{Channel, Dial, UnfinishedHex};
 pub use crate::document::{Document, DocumentError};
 pub use crate::keys::{KeyCode, KeyEvent, KeyKind, Mods};
 pub use crate::palette::{Derivation, HsbOffset, Palette, PaletteError, Recolour, Swatch};

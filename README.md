@@ -170,23 +170,33 @@ random colour nothing holds for a new swatch, on the swatch's own colour for `F2
                        ^
 > ███     H:  16 ; S:  85 ; B:  89  #e25822
                        v
+          Max S if/when typing: 100. Or: #rrggbb
 ```
 
-`←` `→` choose hue, saturation or brightness, and the `^` `v` point at the one chosen. `↑` `↓`
-turn it a degree or a percent, `PageUp` `PageDown` ten, and holding keeps turning. Beside the dial,
-on black so that nothing behind them interferes, three strips show each range from its top
-(highest) to its bottom, with a `<` at the value: the hue strip is always the pure wheel, and
-saturation and brightness are slices through the colour as it is. A value that turning would not
-change right now — the hue of a grey, the saturation of black — is dim. While `F2`'s dial is
-turned, the drawing shows the new colour, but nothing changes until `Enter` keeps it and goes on to
-naming; `Esc` gives it up. A colour another swatch holds can be dialled past but not kept, and the
-status row says whose it is. A dial turned and turned back is no change: the colour comes back to
-the bit, so nothing is recoloured and the file stays clean.
+`←` `→`, or `Tab` `Shift+Tab`, choose hue, saturation or brightness, and the `^` `v` point at the
+one chosen. `↑` `↓` turn it a degree or a percent, `PageUp` `PageDown` ten, and holding keeps
+turning. Or type it, with no mode to switch into: digits go straight into the value, taking effect
+at each one — `1` `2` `0` is 120 — and `#` with six hex digits, or three for the shorthand, sets
+exactly that colour, the one way to name a colour turning cannot land on. `Backspace` takes a digit
+back. A hex colour half typed holds the other keys until it is finished, and `Esc` gives it up. The
+blue line under the dial gives the most the chosen value takes when it is typed — 359 for hue, 100
+for saturation and brightness — and the hex colour that will do instead.
+
+Beside the dial, on black so that nothing behind them interferes, three strips show each range
+from its top (highest) to its bottom, with a `<` at the value: the hue strip is always the pure
+wheel, and saturation and brightness are slices through the colour as it is. A value that turning
+would not change right now — the hue of a grey, the saturation of black — is dim. While `F2`'s dial
+is turned, the drawing shows the new colour, but nothing changes until `Enter` or `Space` keeps it
+and goes on to naming; `Esc` gives it up. A colour another swatch holds can be dialled past but not
+kept, and the status row says whose it is. A dial turned and turned back is no change: the colour
+comes back to the bit, so nothing is recoloured and the file stays clean.
 
 **Naming.** Keeping a colour on the dial, for `[+]` or `F2`, drops straight into naming it: the
 row shows the name being typed with a prompt in the swatch's own colour. Type, `Backspace` to
 fix, `Enter` to keep, `Esc` to leave it as it was. A name the palette will not take (a duplicate,
-or empty) is refused with a notice and left on screen to be corrected rather than thrown away.
+or empty) is refused with a notice and left on screen to be corrected rather than thrown away. The
+colour and the name are one thing done, so they are one undo: `Ctrl+Z` takes the new swatch away,
+or gives back both the old colour and the old name.
 
 **The split view** shows the drawing twice: a canvas where every cell is a solid block of its
 colour — black where it has none — so coverage is easy to judge, and the art as it will really
@@ -301,6 +311,11 @@ references. When a swatch moves, every cell holding its old colour is rewritten 
 history entry mentioning it — otherwise undoing an old paint would put a colour back on the canvas
 that no swatch owns. A rename is carried into the history the same way, so undoing the `[+]` that
 made a swatch still finds it under the name it has now.
+
+**Undo and redo are all or nothing.** One undo can hold several changes — a drag of the pen, or a
+colour and the name given it — and the palette can refuse some of them, as when an edit made in
+code takes a colour an undo would give back. So every change is checked first, on a copy of the
+palette, and an undo that cannot happen whole does not happen at all; the status row says why.
 
 **Ctrl+C salvages rather than argues.** An interrupt that stopped to ask about unsaved work would
 not be an interrupt; one that silently dropped the work would be worse. So `Ctrl+C` writes any

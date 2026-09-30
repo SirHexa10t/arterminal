@@ -1,6 +1,4 @@
 
-handle color-definition in creation and in F2
-
 color compression?
 
 

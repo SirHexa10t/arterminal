@@ -257,7 +257,7 @@ fn sudo_command(sudo: &Path, exe: &Path, args: impl IntoIterator<Item = OsString
 }
 
 /// Where sudo is taken from: fixed system paths, and never `PATH`. The program asking for the
-/// password is exactly what a planted `sudo` early in `PATH` would impersonate — the argv[0]
+/// password is exactly what a planted `sudo` early in `PATH` would impersonate — the `argv[0]`
 /// threat again, at the one moment the user has just been told to type their password.
 ///
 /// Most trusted first. `/usr/local/bin` comes last because it is the one most often writable by a

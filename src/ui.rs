@@ -550,10 +550,16 @@ impl Picker {
     /// Start renaming the swatch `at` rows down: its label becomes the text being typed, with the
     /// cursor at its end so the name can be extended or backspaced.
     pub fn begin_rename(&mut self, at: usize) -> bool {
+        self.begin_naming(at, false)
+    }
+
+    /// [`Picker::begin_rename`], saying whether the name `joins` the edit just recorded — see
+    /// [`LabelEdit::joins`].
+    fn begin_naming(&mut self, at: usize, joins: bool) -> bool {
         let Some(swatch) = self.palette.at(at) else { return false };
         let label = swatch.label().to_string();
         self.lift_pen();
-        self.editing = Some(LabelEdit { at, text: label.clone(), original: label });
+        self.editing = Some(LabelEdit { at, text: label.clone(), original: label, joins });
         self.view.follow = true;
         self.focus = Focus::Swatch { at };
         true
@@ -561,12 +567,29 @@ impl Picker {
 
     /// Keep the label as typed. `Err` — and still editing — if the palette refuses the name,
     /// so the person can fix it rather than lose it.
+    ///
+    /// A name given straight after `[+]` added its swatch, or F2 kept its new colour, is ONE undo
+    /// with that edit, as it was one thing to do: taking back half of it — the name, but not the
+    /// colour it came with — is not what anyone did.
     pub fn commit_rename(&mut self) -> Result<(), PaletteError> {
         let Some(edit) = self.editing.as_ref() else { return Ok(()) };
-        let (from, to) = (edit.original.clone(), edit.text.clone());
+        let (from, to, joins) = (edit.original.clone(), edit.text.clone(), edit.joins);
         if from != to {
-            self.apply_rename(&from, &to)?;
-            self.history.push(Edit::Rename { from, to });
+            // The edit this name completes is held aside while the rename is carried into the
+            // history, so that it keeps the name it was made under — see [`Edit::Stroke`].
+            let first = if joins { self.history.take_done() } else { None };
+            if let Err(why) = self.apply_rename(&from, &to) {
+                // Refused before anything moved, so it goes back exactly as it was.
+                if let Some(first) = first {
+                    self.history.put_done(first);
+                }
+                return Err(why);
+            }
+            let rename = Edit::Rename { from, to };
+            match first {
+                Some(first) => self.history.put_done(Edit::Stroke(vec![first, rename])),
+                None => self.history.push(rename),
+            }
         }
         self.editing = None;
         Ok(())
@@ -580,11 +603,17 @@ impl Picker {
     /// Rename in the palette, and everywhere else the old name was held.
     fn apply_rename(&mut self, from: &str, to: &str) -> Result<(), PaletteError> {
         self.palette.rename(from, to)?;
+        self.carry_name(from, to);
+        Ok(())
+    }
+
+    /// Carry a swatch's new name to everything else that holds the old one — the brush, and the
+    /// history — once the palette has taken it.
+    fn carry_name(&mut self, from: &str, to: &str) {
         if self.brush.as_deref() == Some(from) {
             self.brush = Some(to.to_string());
         }
         self.history.rename(from, to);
-        Ok(())
     }
 
     /// `[+]`: start choosing the colour of a new swatch on the dial, from a random colour nothing
@@ -620,10 +649,12 @@ impl Picker {
     /// Keep the colour on the dial, and go on to naming its swatch, as [`Picker::begin_rename`]
     /// does: `[+]`'s colour becomes a new swatch under a generated name, and F2's becomes its
     /// swatch's colour — the drawing with it, see [`Picker::set_swatch_color`] — when it is a
-    /// different colour at all. A dial turned and turned back is not, and records nothing.
+    /// different colour at all. A dial turned and turned back is not, and records nothing. The
+    /// name given next is one undo with what this records; see [`Picker::commit_rename`].
     ///
     /// `Err`, and still dialling, when another swatch holds the colour: two swatches cannot share
-    /// one, and turning on to a free colour is better than losing the dial.
+    /// one, and turning on to a free colour is better than losing the dial. What is being typed
+    /// counts only once ended, which the keys do first — see [`Dial::end_typing`].
     pub fn commit_colour(&mut self) -> Result<(), PaletteError> {
         let Some(ColourEdit { target, dial }) = self.colour_edit else { return Ok(()) };
         let at = match target {
@@ -640,7 +671,9 @@ impl Picker {
             }
         };
         self.colour_edit = None;
-        self.begin_rename(at);
+        // Named next; the name is one undo with what was just recorded, if anything was.
+        let recorded = target == Target::New || dial.is_changed();
+        self.begin_naming(at, recorded);
         Ok(())
     }
 
@@ -696,7 +729,7 @@ impl Picker {
     pub fn undo(&mut self) -> bool {
         self.lift_pen();
         let Some(edit) = self.history.take_done() else { return false };
-        match self.reverse(&edit) {
+        match self.replay(&edit, Way::Back) {
             Ok(()) => {
                 self.history.put_undone(edit);
                 true
@@ -713,7 +746,7 @@ impl Picker {
     pub fn redo(&mut self) -> bool {
         self.lift_pen();
         let Some(edit) = self.history.take_undone() else { return false };
-        match self.forward(&edit) {
+        match self.replay(&edit, Way::Forward) {
             Ok(()) => {
                 self.history.put_done(edit);
                 true
@@ -726,38 +759,54 @@ impl Picker {
         }
     }
 
-    fn forward(&mut self, edit: &Edit) -> Result<(), PaletteError> {
-        match edit {
-            Edit::Paint { x, y, to, .. } => {
-                self.canvas.cell_mut(*x, *y).expect("the canvas does not resize").ink = *to;
-                Ok(())
-            }
-            Edit::Stroke(parts) => parts.iter().try_for_each(|part| self.forward(part)),
-            Edit::AddSwatch { label, color } => self.palette.push(label.clone(), *color),
-            Edit::Recolour { label, to, .. } => self.set_swatch_color(label, *to).map(drop),
-            Edit::Rename { from, to } => self.apply_rename(from, to),
+    /// Replay `edit` one `way`, WHOLE or not at all.
+    ///
+    /// Only the palette can refuse — a colour, or a name, that some other swatch has since taken —
+    /// and a stroke can hold more than one edit it might refuse: a swatch's new colour and its
+    /// name. So it is asked first, of every part in the order the replay runs them, on a copy. A
+    /// refusal there changes nothing at all; and once the copy has said yes, the palette itself
+    /// cannot say no, since it is asked the same things in the same order from the same place.
+    ///
+    /// NOT the alternative of replaying part by part and walking back on a refusal: the walking
+    /// back would be asked of the palette too, and could be refused in its turn. Before this, a
+    /// stroke replayed part by part and stopped at a refusal with the parts before it done, while
+    /// the history went on saying none of it was — harmless only as long as strokes held nothing
+    /// but paint, which is never refused.
+    fn replay(&mut self, edit: &Edit, way: Way) -> Result<(), PaletteError> {
+        if edit.moves_the_palette() {
+            let mut trial = self.palette.clone();
+            edit.for_each_part(way, &mut |part| part.apply_to_palette(&mut trial, way).map(drop))?;
         }
+        edit.for_each_part(way, &mut |part| self.replay_part(part, way))
+            .expect("the palette agreed to every part a moment ago, on a copy, in this order");
+        Ok(())
     }
 
-    fn reverse(&mut self, edit: &Edit) -> Result<(), PaletteError> {
-        match edit {
-            Edit::Paint { x, y, from, .. } => {
-                self.canvas.cell_mut(*x, *y).expect("the canvas does not resize").ink = *from;
-                Ok(())
+    /// Replay one edit — not a stroke, whose parts come here one at a time — one `way`: the
+    /// palette's share, then everything that follows from it.
+    fn replay_part(&mut self, part: &Edit, way: Way) -> Result<(), PaletteError> {
+        if let (Edit::AddSwatch { label, .. }, Way::Back) = (part, way) {
+            // Safe without checking the canvas: edits are undone last-in first-out, so every
+            // paint made with this swatch has already been undone by the time this is.
+            debug_assert!(
+                !self
+                    .canvas
+                    .rows()
+                    .flatten()
+                    .any(|cell| { cell.ink == self.palette.get(label).map(Swatch::color) }),
+                "an AddSwatch undone while its colour was still painted"
+            );
+        }
+        let moved = part.apply_to_palette(&mut self.palette, way)?;
+        match (part, way) {
+            (Edit::Paint { x, y, from, to }, way) => {
+                let ink = match way {
+                    Way::Back => *from,
+                    Way::Forward => *to,
+                };
+                self.canvas.cell_mut(*x, *y).expect("the canvas does not resize").ink = ink;
             }
-            Edit::Stroke(parts) => parts.iter().rev().try_for_each(|part| self.reverse(part)),
-            Edit::AddSwatch { label, .. } => {
-                // Safe without checking the canvas: edits are undone last-in first-out, so every
-                // paint made with this swatch has already been undone by the time this is.
-                debug_assert!(
-                    !self
-                        .canvas
-                        .rows()
-                        .flatten()
-                        .any(|cell| { cell.ink == self.palette.get(label).map(Swatch::color) }),
-                    "an AddSwatch undone while its colour was still painted"
-                );
-                self.palette.remove(label)?;
+            (Edit::AddSwatch { label, .. }, Way::Back) => {
                 if self.brush.as_deref() == Some(label) {
                     self.brush = None;
                 }
@@ -765,11 +814,13 @@ impl Picker {
                     self.view.follow = true;
                     self.focus = Focus::Add;
                 }
-                Ok(())
             }
-            Edit::Recolour { label, from, .. } => self.set_swatch_color(label, *from).map(drop),
-            Edit::Rename { from, to } => self.apply_rename(to, from),
+            (Edit::Recolour { .. }, _) => self.carry_colours(&moved),
+            (Edit::Rename { from, to }, Way::Forward) => self.carry_name(from, to),
+            (Edit::Rename { from, to }, Way::Back) => self.carry_name(to, from),
+            (Edit::AddSwatch { .. }, Way::Forward) | (Edit::Stroke(_), _) => {}
         }
+        Ok(())
     }
 
     /// Move a swatch to a new colour, and repaint the drawing to match.
@@ -792,7 +843,14 @@ impl Picker {
         color: impl Into<Ink>,
     ) -> Result<Recolour, PaletteError> {
         let recolour = self.palette.set_color(label, color)?;
-        for (was, now) in recolour.changes() {
+        self.carry_colours(recolour.changes());
+        Ok(recolour)
+    }
+
+    /// Carry the palette's `(was, now)` colour changes into the drawing and the history — the
+    /// half of a recolour the palette cannot do itself. See [`Picker::set_swatch_color`].
+    fn carry_colours(&mut self, changes: &[(Ink, Ink)]) {
+        for (was, now) in changes {
             for cell in self.canvas.cells_mut() {
                 if cell.ink == Some(*was) {
                     cell.ink = Some(*now);
@@ -800,7 +858,6 @@ impl Picker {
             }
             self.history.recolour(*was, *now);
         }
-        Ok(recolour)
     }
 
     /// Write the document back to the path it was opened from.
@@ -864,13 +921,13 @@ impl Picker {
         self.palette.len() + 3 + self.dial_lines().map_or(0, |(_, added)| added)
     }
 
-    /// Where the dial's three lines start in the body while it is open, and how many lines they
-    /// add to it: two for F2's, which stand where its swatch's row was, and three for `[+]`'s,
-    /// which stand before the button, where the new swatch will be.
+    /// Where the dial's lines start in the body while it is open, and how many lines they add to
+    /// it: all but one for F2's, which stand where its swatch's row was, and all of them for
+    /// `[+]`'s, which stand before the button, where the new swatch will be.
     fn dial_lines(&self) -> Option<(usize, usize)> {
         self.colour_edit.as_ref().map(|edit| match edit.target {
-            Target::Existing(at) => (at, 2),
-            Target::New => (self.palette.len(), 3),
+            Target::Existing(at) => (at, DialLine::ALL.len() - 1),
+            Target::New => (self.palette.len(), DialLine::ALL.len()),
         })
     }
 
@@ -937,7 +994,7 @@ impl Picker {
         view.rows = rows.max(1);
         if view.follow {
             // The dial's lines above and below the cursor are part of what must be seen — and the
-            // cursor's own line has the last word, on a terminal too short for all three.
+            // cursor's own line has the last word, on a terminal too short for all of them.
             if let Some((first, _)) = self.dial_lines() {
                 view.top = follow(view.top, first + DialLine::ALL.len() - 1, rows);
                 view.top = follow(view.top, first, rows);
@@ -1147,7 +1204,7 @@ enum BodyLine {
     Preview(usize),
 }
 
-/// The dial's three lines, from the top.
+/// The dial's lines, from the top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DialLine {
     /// A `^` over the value the arrows turn.
@@ -1156,10 +1213,12 @@ enum DialLine {
     Values,
     /// A `v` under the value the arrows turn.
     Below,
+    /// In blue: how to type the value exactly — see [`dial_tip`].
+    Tip,
 }
 
 impl DialLine {
-    const ALL: [DialLine; 3] = [DialLine::Above, DialLine::Values, DialLine::Below];
+    const ALL: [DialLine; 4] = [DialLine::Above, DialLine::Values, DialLine::Below, DialLine::Tip];
 }
 
 /// The cells the pen covers.
@@ -1196,6 +1255,16 @@ struct LabelEdit {
     text: String,
     /// What to put back on Esc.
     original: String,
+    /// Whether this name is the second half of the edit just recorded — `[+]` adding the swatch,
+    /// or F2 moving its colour — and is taken back and put back with it, as one.
+    joins: bool,
+}
+
+/// Which way an edit is replayed: back, as undo does, or forward, as redo does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Way {
+    Back,
+    Forward,
 }
 
 /// A colour part-way through being chosen.
@@ -1223,7 +1292,13 @@ enum Edit {
         from: Option<Ink>,
         to: Option<Ink>,
     },
-    /// Everything painted while the pen was down, so one drag is one undo.
+    /// Several edits taken back and put back as one: everything painted while the pen was down,
+    /// so one drag is one undo — or a swatch's adding or new colour, and the name it was given
+    /// straight after; see [`Picker::commit_rename`]. Replayed whole or not at all, see
+    /// [`Picker::replay`].
+    ///
+    /// Its parts hold the names in force when each was made, as a [`Edit::Rename`] does, and
+    /// last-in-first-out order keeps them true the same way; [`History::rename`] leaves them be.
     Stroke(Vec<Edit>),
     AddSwatch {
         label: String,
@@ -1245,6 +1320,69 @@ enum Edit {
 }
 
 impl Edit {
+    /// Whether replaying this asks anything of the palette, which is what can refuse — see
+    /// [`Picker::replay`]. Not for paint alone, which is most of what a history holds.
+    fn moves_the_palette(&self) -> bool {
+        match self {
+            Edit::Paint { .. } => false,
+            Edit::Stroke(parts) => parts.iter().any(Edit::moves_the_palette),
+            Edit::AddSwatch { .. } | Edit::Recolour { .. } | Edit::Rename { .. } => true,
+        }
+    }
+
+    /// Visit every edit that replaying this one `way` runs, one at a time, in the order it runs
+    /// them: this one, or a stroke's parts — first to last going forward, last to first going
+    /// back — however deeply strokes nest. Stops at the first `Err`.
+    fn for_each_part<E>(
+        &self,
+        way: Way,
+        visit: &mut impl FnMut(&Edit) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match (self, way) {
+            (Edit::Stroke(parts), Way::Forward) => {
+                parts.iter().try_for_each(|part| part.for_each_part(way, visit))
+            }
+            (Edit::Stroke(parts), Way::Back) => {
+                parts.iter().rev().try_for_each(|part| part.for_each_part(way, visit))
+            }
+            (single, _) => visit(single),
+        }
+    }
+
+    /// Replaying this one `way` as far as the palette is concerned — the one share of undoing or
+    /// redoing that can be refused — done to `palette`: the picker's own, or a copy, to ask
+    /// first. The colour changes it made, for the drawing and the history to follow; see
+    /// [`Picker::carry_colours`]. THE ONE PLACE an edit is turned into palette calls, so asking
+    /// first and doing can never disagree.
+    fn apply_to_palette(
+        &self,
+        palette: &mut Palette,
+        way: Way,
+    ) -> Result<Vec<(Ink, Ink)>, PaletteError> {
+        // Most palette calls move no colours: they answer with nothing, or with the swatch taken
+        // out, which is only the palette's to hold.
+        fn nothing<T>(_: T) -> Vec<(Ink, Ink)> {
+            Vec::new()
+        }
+        match (self, way) {
+            (Edit::Paint { .. }, _) => Ok(Vec::new()),
+            (Edit::Stroke(_), _) => unreachable!("a stroke is replayed a part at a time"),
+            (Edit::AddSwatch { label, color }, Way::Forward) => {
+                palette.push(label.clone(), *color).map(nothing)
+            }
+            (Edit::AddSwatch { label, .. }, Way::Back) => palette.remove(label).map(nothing),
+            (Edit::Recolour { label, from, to }, way) => {
+                let colour = match way {
+                    Way::Back => *from,
+                    Way::Forward => *to,
+                };
+                palette.set_color(label, colour).map(|change| change.changes().to_vec())
+            }
+            (Edit::Rename { from, to }, Way::Forward) => palette.rename(from, to).map(nothing),
+            (Edit::Rename { from, to }, Way::Back) => palette.rename(to, from).map(nothing),
+        }
+    }
+
     /// Bytes this edit keeps on the heap beyond its own slot in a list: a stroke's list of parts
     /// and whatever those keep, and the labels a swatch's edit carries.
     fn heap_bytes(&self) -> usize {
@@ -1411,7 +1549,8 @@ impl History {
         }
     }
 
-    /// Carry a swatch's new name into every edit that held the old one.
+    /// Carry a swatch's new name into every edit on the lists that held the old one. Not into a
+    /// stroke's parts, which keep the names of their moment — see [`Edit::Stroke`].
     fn rename(&mut self, from: &str, to: &str) {
         let lists =
             [(&mut self.done, &mut self.done_heap), (&mut self.undone, &mut self.undone_heap)];
@@ -1525,14 +1664,24 @@ const DIAL_VALUES_AT: usize = GUTTER + SWATCH_WIDTH + LABEL_GAP.len();
 /// Between the dial's values and the name of the colour after them.
 const DIAL_NAME_GAP: &str = "  ";
 
-/// The column the strips beside the dial start at: two past the widest the dial's middle line can
-/// be — `slot 255` is the longest name a colour has — so the strips hold still as numbers change.
-const STRIPS_AT: usize = DIAL_VALUES_AT
+/// The column the colour's name starts at, after the dial's values.
+const DIAL_NAME_AT: usize = DIAL_VALUES_AT
     + Channel::ALL.len() * DIAL_VALUE_WIDTH
     + (Channel::ALL.len() - 1) * DIAL_SEPARATOR.len()
-    + DIAL_NAME_GAP.len()
-    + "slot 255".len()
-    + 2;
+    + DIAL_NAME_GAP.len();
+
+/// The widest the tip under the dial can be — see [`dial_tip`] — with the widest letter and the
+/// longest largest value. `a_dial_tip_ends_before_the_strips` holds every real tip to it.
+const DIAL_TIP_WIDEST: &str = "Max H if/when typing: 359. Or: #rrggbb";
+
+/// The column the strips beside the dial start at: two past the widest of the dial's lines —
+/// its middle one naming the colour by its longest name, `slot 255`, which a hex colour being
+/// typed, caret and all, is shorter than; or the tip under it — so that the strips hold still as
+/// numbers change, and nothing the dial says ever runs under them.
+const STRIPS_AT: usize = {
+    let (middle, tip) = (DIAL_NAME_AT + "slot 255".len(), DIAL_VALUES_AT + DIAL_TIP_WIDEST.len());
+    (if middle > tip { middle } else { tip }) + 2
+};
 
 /// Columns of colour in each cell of a strip: two, so it reads as a bar rather than a rule.
 const STRIP_WIDTH: usize = 2;
@@ -1747,39 +1896,75 @@ fn seen_through<'a>(row: &'a [Cell], moves: &[(Ink, Ink)]) -> Cow<'a, [Cell]> {
     }
 }
 
-/// One of the dial's lines. The middle one is the colour and its three values; the lines above
-/// and below point at the value the arrows turn, as the layout was specified:
+/// One of the dial's lines. The second is the colour and its three values; the lines either
+/// side point at the value the arrows turn, as the layout was specified, and under them, in blue,
+/// is how to type that value exactly:
 ///
 /// ```text
 ///     ^
 /// H:  55 ; S:  64 ; B:  77
 ///     v
+/// Max H if/when typing: 359. Or: #rrggbb
 /// ```
 fn dial_line(picker: &Picker, edit: &ColourEdit, part: DialLine) -> String {
     let dial = &edit.dial;
-    let pointer = |mark: char| format!("{}{mark}", " ".repeat(pointer_column(dial.channel())));
+    let pointer = |mark: char| format!("{}{mark}", " ".repeat(pointer_column(dial)));
     match part {
         DialLine::Above => pointer('^'),
         DialLine::Values => dial_values(dial, dialled_ink(picker, edit)),
         DialLine::Below => pointer('v'),
+        DialLine::Tip => {
+            let tip = stderr_style().fg(DIAL_TIP_INK).apply_to(dial_tip(dial));
+            format!("{}{tip}", " ".repeat(DIAL_VALUES_AT))
+        }
+    }
+}
+
+/// The tip under the dial: the most the value the arrows turn takes, for when it is typed rather
+/// than turned — worded so as not to suggest typing is the only way — and that a colour can be
+/// typed in hex instead. While one is, what it takes.
+///
+/// Plain ASCII, starting where the values do. The strips beside the dial start past the widest
+/// it can be, [`DIAL_TIP_WIDEST`], which `a_dial_tip_ends_before_the_strips` holds true.
+fn dial_tip(dial: &Dial) -> String {
+    match dial.typed_hex() {
+        Some(_) => "#rrggbb, or #rgb; esc gives it up".to_string(),
+        None => {
+            let channel = dial.channel();
+            format!("Max {} if/when typing: {}. Or: #rrggbb", channel.letter(), channel.largest())
+        }
     }
 }
 
 /// The dial's middle line: the colour, its hue, saturation and brightness as shown — each dim
-/// while turning it would change nothing, see [`Dial::in_effect`] — and the colour as the file
-/// names it. The cursor's line, for as long as the dial is open.
+/// while turning it would change nothing, see [`Dial::in_effect`], and underlined while a number
+/// is being typed into it — and the colour as the file names it, or in its place the hex colour
+/// being typed, with a caret where its next digit goes. The cursor's line, while the dial is open.
 fn dial_values(dial: &Dial, ink: Ink) -> String {
     let block = stderr_style().bg(console_color(ink)).apply_to(" ".repeat(SWATCH_WIDTH));
     let values = Channel::ALL
         .map(|channel| {
             let value = dial_value(channel, dial.shown(channel));
-            match dial.in_effect(channel) {
-                true => value,
-                false => stderr_style().dim().apply_to(value).to_string(),
+            let typing = dial.is_typing_number() && channel == dial.channel();
+            match (dial.in_effect(channel), typing) {
+                (true, false) => value,
+                (in_effect, typing) => {
+                    let mut style = stderr_style();
+                    if !in_effect {
+                        style = style.dim();
+                    }
+                    if typing {
+                        style = style.underlined();
+                    }
+                    style.apply_to(value).to_string()
+                }
             }
         })
         .join(DIAL_SEPARATOR);
-    let named = stderr_style().dim().apply_to(ink);
+    let named = match dial.typed_hex() {
+        Some(digits) => format!("#{digits}{}", stderr_style().reverse().apply_to(' ')),
+        None => stderr_style().dim().apply_to(ink).to_string(),
+    };
     format!("{CURSOR_MARK}{block}{LABEL_GAP}{values}{DIAL_NAME_GAP}{named}")
 }
 
@@ -1799,9 +1984,13 @@ fn dialled_ink(picker: &Picker, edit: &ColourEdit) -> Ink {
     own.unwrap_or(Ink::Rgb(edit.dial.rgb()))
 }
 
-/// The column the `^` and `v` stand in for `channel`: over the middle of its three digits.
-fn pointer_column(channel: Channel) -> usize {
-    let at = Channel::ALL.iter().position(|c| *c == channel).expect("one of the three");
+/// The column the `^` and `v` stand in: over the middle of the three digits of the channel the
+/// arrows turn — or, while a hex colour is typed, over where its next digit goes.
+fn pointer_column(dial: &Dial) -> usize {
+    if let Some(digits) = dial.typed_hex() {
+        return DIAL_NAME_AT + "#".len() + digits.len();
+    }
+    let at = Channel::ALL.iter().position(|c| *c == dial.channel()).expect("one of the three");
     DIAL_VALUES_AT + at * (DIAL_VALUE_WIDTH + DIAL_SEPARATOR.len()) + DIAL_VALUE_WIDTH - 2
 }
 
@@ -2164,6 +2353,11 @@ const FILE_INK: console::Color = console::Color::Yellow;
 const COLOUR_INK: console::Color = console::Color::Green;
 const VIEW_INK: console::Color = console::Color::Cyan;
 
+/// The colour of the tip under the dial: blue, as asked for. The terminal's own blue, as the hint
+/// lines' colours are their terminal's own, so each theme draws it in a shade chosen to read on
+/// it.
+const DIAL_TIP_INK: console::Color = console::Color::Blue;
+
 /// The grey of each hint line's title. Fixed rather than the terminal's own "bright black",
 /// which some themes — Solarized's dark one — make the colour of the background itself.
 const TITLE_INK: Rgb = Rgb::new(128, 128, 128);
@@ -2236,14 +2430,16 @@ fn colour_hints(picker: &Picker) -> Vec<Hint> {
     // The ways out before the long way round: on a narrow terminal the end of the line is cut.
     if let Some(edit) = &picker.colour_edit {
         let keep = match edit.target {
-            Target::New => "add, then name",
-            Target::Existing(_) => "keep, then rename",
+            Target::New => "add",
+            Target::Existing(_) => "keep",
         };
         return vec![
-            ("←→", "pick H, S or B"),
-            ("↑↓", "turn it"),
-            ("enter", keep),
+            ("←→", "H/S/B"),
+            ("↑↓", "turn"),
+            ("space/enter", keep),
             ("esc", "cancel"),
+            ("0-9", "type"),
+            ("#", "hex"),
             ("pgup/pgdn", "by 10"),
         ];
     }
@@ -2456,12 +2652,15 @@ fn tail(line: &str, from: usize, wide: bool) -> String {
 ///   screen and draw everything again. `F6` splits the art into a canvas over a preview, and
 ///   `Shift+F6` into the two side by side; each puts it back together from its own layout. In a
 ///   split, `c` shows or hides the cursor on the preview.
-/// - While a colour is on the dial, `←`/`→` choose hue, saturation or brightness, `↑`/`↓` turn
-///   it a step and `Page Up`/`Page Down` ten, all of them repeating while held. `Enter` keeps the
-///   colour — adding `[+]`'s swatch, or recolouring F2's if the colour changed — and goes on to
-///   its name; `Esc` gives it up. Nothing else acts until one of those. See [`crate::dial`].
+/// - While a colour is on the dial, `←`/`→` — or `Tab`/`Shift+Tab` — choose hue, saturation or
+///   brightness, `↑`/`↓` turn it a step and `Page Up`/`Page Down` ten, all of them repeating while
+///   held. Digits type a value straight in and `#` a whole colour in hex; see
+///   [`Dial::type_char`]. `Enter` or `Space` keeps the colour — adding `[+]`'s swatch, or
+///   recolouring F2's if the colour changed — and goes on to its name; `Esc` gives up a hex colour
+///   half typed, and otherwise the dial. Nothing else acts until one of those.
 /// - While a name is being typed, keys type, `Backspace` deletes, `Enter` keeps it, `Esc` gives
-///   it up. Nothing else acts until one of those.
+///   it up. Nothing else acts until one of those. A name given straight after the dial is one
+///   undo with the colour; see [`Picker::commit_rename`].
 /// - `Ctrl+S` asks for a save — asks, because this function touches no file.
 /// - `Ctrl+Z` undoes, repeatedly if held. `Ctrl+Shift+Z` redoes where the terminal can tell it
 ///   from `Ctrl+Z` — one speaking the kitty keyboard protocol reports the Shift — and `Ctrl+Y`
@@ -2636,22 +2835,48 @@ fn apply_to_rename(picker: &mut Picker, event: KeyEvent) -> Action {
     }
 }
 
-/// Keys while a colour is on the dial. Left and Right choose hue, saturation or brightness; Up
-/// and Down turn it a step, Page Up and Page Down ten — all four on every repeat too, since
-/// holding is how a dial is turned a long way. Enter keeps the colour and goes on to its name, Esc
-/// gives it up; both on a press only, as while a name is typed. Everything else is swallowed: a
-/// stray key must not paint, undo or save while a colour is half chosen.
+/// Keys while a colour is on the dial. Left and Right — or Tab and Shift+Tab, as in a form —
+/// choose hue, saturation or brightness; Up and Down turn it a step, Page Up and Page Down ten,
+/// all on every repeat too, since holding is how a dial is turned a long way. Digits type a value
+/// straight in and `#` a whole colour in hex, with no mode to switch into, since neither means
+/// anything else here — see [`Dial::type_char`] — and Backspace takes back what was typed.
+///
+/// Enter or Space keeps the colour and goes on to its name, as the two do the same thing
+/// everywhere else. Esc gives up a hex colour half typed, and otherwise the dial. Those act on a
+/// press only, as while a name is typed. Everything else is swallowed: a stray key must not
+/// paint, undo or save while a colour is half chosen.
 fn apply_to_dial(picker: &mut Picker, event: KeyEvent) -> Action {
     let pressed = event.kind == KeyKind::Press;
+    let typed = event.text.filter(|_| !event.mods.ctrl && !event.mods.alt);
     let dial = &mut picker.colour_edit.as_mut().expect("dialling").dial;
-    match event.code {
-        KeyCode::Left => redraw_if(dial.select(-1)),
-        KeyCode::Right => redraw_if(dial.select(1)),
+    // What is being typed comes first.
+    if typed.is_some_and(|c| dial.type_char(c)) {
+        return Action::Redraw;
+    }
+    if event.code == KeyCode::Backspace {
+        return redraw_if(dial.erase());
+    }
+    if event.code == KeyCode::Escape && pressed && dial.typed_hex().is_some() {
+        dial.drop_hex();
+        return Action::Redraw;
+    }
+    // Any other key ends what is being typed before it acts — except that a hex colour which is
+    // no colour yet holds every key until it is finished or given up, and says so.
+    let ended = match dial.end_typing() {
+        Ok(ended) => ended,
+        Err(unfinished) => {
+            picker.notice = Some(unfinished.to_string());
+            return Action::Redraw;
+        }
+    };
+    let action = match event.code {
+        KeyCode::Left | KeyCode::BackTab => redraw_if(dial.select(-1)),
+        KeyCode::Right | KeyCode::Tab => redraw_if(dial.select(1)),
         KeyCode::Up => redraw_if(dial.turn(1)),
         KeyCode::Down => redraw_if(dial.turn(-1)),
         KeyCode::PageUp => redraw_if(dial.turn(DIAL_PAGE)),
         KeyCode::PageDown => redraw_if(dial.turn(-DIAL_PAGE)),
-        KeyCode::Enter if pressed => {
+        KeyCode::Enter | KeyCode::Char(' ') if pressed => {
             if let Err(why) = picker.commit_colour() {
                 picker.notice = Some(format!("not kept: {why}"));
             }
@@ -2659,6 +2884,11 @@ fn apply_to_dial(picker: &mut Picker, event: KeyEvent) -> Action {
         }
         KeyCode::Escape if pressed => redraw_if(picker.cancel_colour()),
         _ => Action::Ignored,
+    };
+    // Ending a number is a change to the frame even when the key itself did nothing.
+    match action {
+        Action::Ignored if ended => Action::Redraw,
+        action => action,
     }
 }
 
@@ -3919,6 +4149,13 @@ mod tests {
         "\u{e9}".as_bytes(),
         "\u{6f22}".as_bytes(),
         b"\x1b[200~p\x1b[201~",
+        // Typing on the dial: a number, a hex colour, kitty's Shift+3 for `#`, and Tab.
+        b"#",
+        b"7",
+        b"0",
+        b"e",
+        b"\x1b[51;2;35u",
+        b"\t",
     ];
 
     /// A fixed corpus of random sessions — random art, palettes, key streams and terminal sizes,
@@ -5143,13 +5380,110 @@ mod tests {
         picker.set_focus(Focus::Swatch { at: 0 });
         press(&mut picker, &[F2, UP]);
         let (dial, dirty) = (*picker.dial().unwrap(), picker.is_dirty());
-        let strays =
-            [SAVE, UNDO, REDO, CLOSE, TAB, BACKTAB, SPACE, BACKSPACE, DELETE, TOGGLE, F2, F6];
+        let strays = [SAVE, UNDO, REDO, CLOSE, BACKSPACE, DELETE, TOGGLE, F2, F6];
         for key in strays.into_iter().chain([ch('i'), ch(']'), ch('c'), ch('x')]) {
             assert_eq!(apply(&mut picker, key), Action::Ignored, "{key:?}");
         }
         assert_eq!(picker.dial(), Some(&dial), "the dial did not move");
         assert_eq!((picker.is_dirty(), picker.split(), picker.pen_size()), (dirty, None, 1));
+    }
+
+    /// Digits type straight into the value the arrows turn, taking effect at once; moving to
+    /// another value ends the number, and the next digits start a new one there.
+    #[test]
+    fn digits_type_straight_into_the_value_the_arrows_turn() {
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2, ch('1'), ch('2'), ch('0')]);
+        assert_eq!(shown(&picker)[0], 120);
+        press(&mut picker, &[RIGHT, ch('5'), ch('0')]);
+        assert_eq!(shown(&picker)[..2], [120, 50]);
+        let dialled = picker.dial().unwrap().rgb();
+        press(&mut picker, &[ENTER]);
+        assert_eq!(picker.palette().at(0).map(Swatch::color), Some(dialled.into()));
+    }
+
+    /// A colour typed in hex is kept exactly — from the bytes a terminal sends, `#` included, as
+    /// kitty spells it: the key `3`, with Shift, typing `#`.
+    #[test]
+    fn a_hex_colour_typed_is_kept_exactly() {
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2]);
+        type_bytes(&mut picker, b"\x1b[51;2;35u4b0082");
+        assert_eq!(picker.dial().map(Dial::rgb), Some(Rgb::new(0x4b, 0x00, 0x82)));
+        press(&mut picker, &[ENTER]);
+        assert_eq!(picker.palette().at(0).map(Swatch::color), Some(Rgb::new(0x4b, 0, 0x82).into()));
+    }
+
+    /// A hex colour half typed is no colour yet, and holds every key until it is finished or
+    /// given up — saying why — while Esc gives up only it, and a second Esc the dial.
+    #[test]
+    fn a_half_typed_hex_holds_every_key_until_finished_or_given_up() {
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2, ch('#'), ch('1'), ch('e'), ch('9'), ch('f')]);
+        for key in [ENTER, RIGHT, UP] {
+            assert_eq!(apply(&mut picker, key), Action::Redraw, "{key:?}");
+            assert!(picker.notice().is_some_and(|n| n.contains("#1e9f is not a colour yet")));
+            assert_eq!(picker.dial().and_then(Dial::typed_hex), Some("1e9f"), "still typing");
+        }
+        assert_eq!(shown(&picker), [0, 75, 89], "nothing moved");
+        assert_eq!(apply(&mut picker, ESC), Action::Redraw);
+        assert_eq!(picker.dial().map(|d| d.typed_hex()), Some(None), "the hex given up");
+        assert_eq!(apply(&mut picker, ESC), Action::Redraw);
+        assert_eq!(picker.dial(), None, "and then the dial");
+    }
+
+    /// Tab and Shift+Tab move between the values as they do in a form, stopping at the ends as
+    /// Left and Right do.
+    #[test]
+    fn tab_and_shift_tab_move_between_values() {
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2, TAB]);
+        assert_eq!(picker.dial().map(Dial::channel), Some(Channel::Saturation));
+        press(&mut picker, &[TAB, TAB]);
+        assert_eq!(picker.dial().map(Dial::channel), Some(Channel::Brightness));
+        press(&mut picker, &[BACKTAB]);
+        assert_eq!(picker.dial().map(Dial::channel), Some(Channel::Saturation));
+    }
+
+    /// While typing, the frame shows it: the number being typed underlined, and a hex colour in
+    /// the place of the colour's name with a caret where its next digit goes — which is where the
+    /// `^` and `v` point.
+    #[test]
+    fn what_is_being_typed_shows_where_it_goes() {
+        with_colour();
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2, ch('7')]);
+        let line = line_showing(&picker, BodyLine::Dial(DialLine::Values));
+        let underlined = stderr_style().underlined().apply_to(dial_value(Channel::Hue, 7));
+        assert!(line.contains(&underlined.to_string()), "{line:?}");
+        press(&mut picker, &[ch('#'), ch('a'), ch('b')]);
+        let line = line_showing(&picker, BodyLine::Dial(DialLine::Values));
+        let caret = stderr_style().reverse().apply_to(' ').to_string();
+        assert!(line.contains(&format!("#ab{caret}")), "{line:?}");
+        assert!(!line.contains(&underlined.to_string()), "the number ended at the #");
+        let above =
+            console::strip_ansi_codes(&line_showing(&picker, BodyLine::Dial(DialLine::Above)))
+                .into_owned();
+        let text = console::strip_ansi_codes(&line).into_owned();
+        let caret_at = text.find("#ab").expect("the hex") + "#ab".len();
+        assert_eq!(above.find('^'), Some(caret_at), "{above:?} over {text:?}");
+    }
+
+    /// Space keeps the colour as Enter does — the two mean the same everywhere — and a held Space
+    /// keeps it once, not once per repeat.
+    #[test]
+    fn space_keeps_the_colour_as_enter_does() {
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2, UP]);
+        let dialled = picker.dial().unwrap().rgb();
+        assert_eq!(apply(&mut picker, repeat(KeyCode::Char(' '))), Action::Ignored, "a repeat");
+        assert!(picker.dial().is_some());
+        assert_eq!(apply(&mut picker, SPACE), Action::Redraw);
+        assert_eq!(picker.dial(), None);
+        assert_eq!(picker.palette().at(0).map(Swatch::color), Some(dialled.into()));
+        assert_eq!(picker.editing(), Some("0"), "and on to the name, where Space types");
+        press(&mut picker, &[SPACE]);
+        assert_eq!(picker.editing(), Some("0 "));
     }
 
     /// Ctrl+C gives up the dial along with everything else, and interrupts.
@@ -5172,39 +5506,39 @@ mod tests {
             .map(|which| footer_line(&render(&picker, 300, 60), 60, which))
             .map(|line| console::strip_ansi_codes(&line).into_owned());
         assert_eq!(file.trim_start_matches("Program:").trim(), "^C quit");
-        for offered in
-            ["pick H, S or B", "turn it", "enter keep, then rename", "esc cancel", "by 10"]
-        {
+        let offered =
+            ["←→ H/S/B", "↑↓ turn", "space/enter keep", "esc cancel", "0-9 type", "# hex"];
+        for offered in offered.into_iter().chain(["pgup/pgdn by 10"]) {
             assert!(draw.contains(offered), "{offered:?} in {draw:?}");
         }
         assert_eq!(view.trim_start_matches("Display:").trim(), "", "nothing on screen acts");
         picker.cancel_colour();
         picker.set_focus(Focus::Add);
         press(&mut picker, &[ENTER]);
-        assert!(hints(&picker).contains("enter add, then name"));
+        assert!(hints(&picker).contains("space/enter add"));
     }
 
     /// The dial's three lines stand where F2's swatch was, and before `[+]` for a new one — and
     /// everything after them moves down to make room, through the one map of the body.
     #[test]
     fn the_dial_stands_where_its_swatch_is() {
-        use DialLine::{Above, Below, Values};
-        let body = |picker: &Picker| (0..6).map(|at| picker.body_line(at)).collect::<Vec<_>>();
+        let dial = DialLine::ALL.map(BodyLine::Dial);
+        let (swatch, add) = (BodyLine::Swatch, BodyLine::Add);
+        let body = |picker: &Picker, lines| -> Vec<BodyLine> {
+            (0..lines).map(|at| picker.body_line(at)).collect()
+        };
         let mut picker = coloured(&[RED, BLUE, Rgb::new(0, 200, 0)], "ab");
         picker.set_focus(Focus::Swatch { at: 1 });
         press(&mut picker, &[F2]);
-        let dial = |part| BodyLine::Dial(part);
-        let (swatch, add) = (BodyLine::Swatch, BodyLine::Add);
-        assert_eq!(
-            body(&picker),
-            [swatch(0), dial(Above), dial(Values), dial(Below), swatch(2), add]
-        );
+        let expected: Vec<BodyLine> =
+            [swatch(0)].into_iter().chain(dial).chain([swatch(2), add]).collect();
+        assert_eq!(body(&picker, expected.len()), expected, "where the second swatch was");
         picker.cancel_colour();
         picker.set_focus(Focus::Add);
         press(&mut picker, &[ENTER]);
-        let expected = [swatch(0), swatch(1), swatch(2), dial(Above), dial(Values), dial(Below)];
-        assert_eq!(body(&picker), expected);
-        assert_eq!(picker.body_line(6), add);
+        let expected: Vec<BodyLine> =
+            [swatch(0), swatch(1), swatch(2)].into_iter().chain(dial).chain([add]).collect();
+        assert_eq!(body(&picker, expected.len()), expected, "before the button");
         assert_eq!(picker.body_line(picker.first_art_line()), BodyLine::Art(0));
     }
 
@@ -5241,6 +5575,57 @@ mod tests {
             assert_eq!(below.find('v'), Some(middle), "{channel:?}: {below:?}");
             press(&mut picker, &[RIGHT]);
         }
+    }
+
+    /// Under the dial, in blue, a tip: the most the value the arrows turn takes, for when it is
+    /// typed — following the arrows from one channel to the next — and that a hex colour will do
+    /// instead; while one is being typed, what it takes.
+    #[test]
+    fn the_tip_under_the_dial_names_what_can_be_typed() {
+        with_colour();
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2]);
+        let tip = |picker: &Picker| line_showing(picker, BodyLine::Dial(DialLine::Tip));
+        let blue = stderr_style().fg(console::Color::Blue).apply_to("x").to_string();
+        let blue = &blue[..blue.find('x').expect("the text")];
+        assert!(tip(&picker).contains(blue), "in blue: {:?}", tip(&picker));
+        for (key, expected) in [
+            (None, "Max H if/when typing: 359. Or: #rrggbb"),
+            (Some(RIGHT), "Max S if/when typing: 100. Or: #rrggbb"),
+            (Some(RIGHT), "Max B if/when typing: 100. Or: #rrggbb"),
+            (Some(ch('#')), "#rrggbb, or #rgb; esc gives it up"),
+        ] {
+            press(&mut picker, &key.into_iter().collect::<Vec<_>>());
+            // The strips follow it on the same line, so it is found where it starts.
+            let text = console::strip_ansi_codes(&tip(&picker)).into_owned();
+            assert_eq!(text.find(expected), Some(DIAL_VALUES_AT), "under the values: {text:?}");
+        }
+    }
+
+    /// The tip starts where the values do and ends before the strips, for every channel and
+    /// while a hex colour is typed — so the strips never stand in the middle of it.
+    #[test]
+    fn a_dial_tip_ends_before_the_strips() {
+        with_colour();
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2]);
+        let mut seen = 0;
+        for keys in [&[][..], &[TAB], &[TAB], &[ch('#')]] {
+            press(&mut picker, keys);
+            let tip = dial_tip(picker.dial().expect("dialling"));
+            for wide in [false, true] {
+                let width = text_width(&tip, wide);
+                assert!(width <= DIAL_TIP_WIDEST.len(), "{tip:?} is wider than the widest, {wide}");
+                assert!(DIAL_VALUES_AT + width < STRIPS_AT, "{tip:?}, wide {wide}");
+            }
+            // And in a frame the strips are drawn in, it is there whole.
+            let lines = render(&picker, 120, 40);
+            assert!(strip_lines(&lines, false).len() > 1, "the strips are drawn");
+            let whole = lines.iter().any(|line| console::strip_ansi_codes(line).contains(&tip));
+            assert!(whole, "{tip:?} in {lines:?}");
+            seen += 1;
+        }
+        assert_eq!(seen, Channel::ALL.len() + 1, "every channel, and a hex colour");
     }
 
     /// The dial's middle line: the colour dialled, its three values, and its name as the file will
@@ -5526,13 +5911,18 @@ mod tests {
         check(&picker, "after a stroke");
         picker.set_focus(Focus::Add);
         press(&mut picker, &[ENTER, ENTER, ch('x'), ENTER]);
-        check(&picker, "after adding and naming a swatch");
-        assert!(picker.undo() && picker.undo(), "the rename and the add");
+        check(&picker, "after a swatch added and named: one edit of two parts");
+        assert!(picker.undo() && picker.undo(), "the swatch with its name, then the stroke");
         check(&picker, "after two undos");
         assert!(picker.redo());
         check(&picker, "after a redo");
-        // The swatch `[+]` added: its AddSwatch is in the history, so renaming it rewrites a label
-        // the history holds, and the label's length changes with it.
+        // A swatch added and left with the name it came with: its AddSwatch is an entry of its
+        // own, so renaming it later rewrites a label the history holds, and the label's length
+        // changes with it. Adding it threw away what could be redone.
+        picker.set_focus(Focus::Add);
+        press(&mut picker, &[ENTER, ENTER, ESC]);
+        check(&picker, "after a new edit threw the redo list away");
+        assert_eq!(picker.history.undone_heap, 0);
         assert!(picker.begin_rename(1));
         press(&mut picker, &[ch('y'), ch('y'), ENTER]);
         assert!(picker
@@ -5541,9 +5931,16 @@ mod tests {
             .iter()
             .any(|edit| matches!(edit, Edit::AddSwatch { label, .. } if label == "colour 2yy")));
         check(&picker, "after a rename rewrote the labels the history holds");
-        picker.set_focus(Focus::Cell { x: 0, y: 0 });
+        // F2's new colour and its name: one edit again, with a label in each part.
+        picker.set_focus(Focus::Swatch { at: 0 });
+        press(&mut picker, &[F2, UP, ENTER, ch('z'), ENTER]);
+        check(&picker, "after a colour and a name kept as one");
+        assert!(picker.undo());
+        check(&picker, "after taking both back");
+        // Far from the stroke, so the paint is a change and a new edit is recorded.
+        picker.set_focus(Focus::Cell { x: 5, y: 5 });
         press(&mut picker, &[SPACE]);
-        check(&picker, "after a new edit threw the redo list away");
+        check(&picker, "after a new edit threw the redo list away once more");
         assert_eq!(picker.history.undone_heap, 0);
     }
 
@@ -5937,15 +6334,134 @@ mod tests {
     #[test]
     fn a_rename_is_undoable_and_redoable() {
         let mut picker = picker(1, "ab");
-        press(&mut picker, &[F2, UP, ENTER]); // recoloured, and naming
+        press(&mut picker, &[F2, ENTER]); // the colour as it was, and naming
         press(&mut picker, &[BACKSPACE, ch('x'), ENTER]); // "colour x"
         assert_eq!(picker.palette().at(0).unwrap().label(), "colour x");
         assert!(picker.undo(), "takes back the rename");
         assert_eq!(picker.palette().at(0).unwrap().label(), "colour 1");
-        assert!(picker.undo(), "takes back the recolour that came with F2");
-        assert!(picker.redo());
+        assert!(!picker.undo(), "and that was all there was");
         assert!(picker.redo());
         assert_eq!(picker.palette().at(0).unwrap().label(), "colour x");
+    }
+
+    /// F2's new colour and the name given straight after are one undo and one redo: it was one
+    /// thing to do, and taking back the name alone would leave a colour nobody asked to keep.
+    #[test]
+    fn f2s_colour_and_name_are_one_undo() {
+        let mut picker = ready_to_paint("ab");
+        press(&mut picker, &[SPACE]);
+        let before = picker.palette().at(0).unwrap().color();
+        picker.set_focus(Focus::Swatch { at: 0 });
+        press(&mut picker, &[F2, PAGE_UP, ENTER, ch('!'), ENTER]);
+        let after = picker.palette().at(0).unwrap().color();
+        assert_eq!(
+            (picker.palette().at(0).unwrap().label(), inks(&picker, 0)[0]),
+            ("colour 1!", Some(after))
+        );
+        let done = picker.history.done.len();
+        assert!(picker.undo(), "one undo");
+        assert_eq!(picker.palette().at(0).unwrap().label(), "colour 1", "the name back");
+        assert_eq!(picker.palette().at(0).unwrap().color(), before, "and the colour");
+        assert_eq!(inks(&picker, 0)[0], Some(before), "and the drawing");
+        assert_eq!(picker.history.done.len(), done - 1);
+        assert!(picker.redo(), "one redo");
+        assert_eq!(picker.palette().at(0).unwrap().label(), "colour 1!");
+        assert_eq!(inks(&picker, 0)[0], Some(after));
+        assert_eq!(picker.brush(), Some("colour 1!"), "the brush followed it both ways");
+    }
+
+    /// The same for `[+]`: the swatch and the name given it straight after are one undo — taking
+    /// it back takes the swatch away — and one redo.
+    #[test]
+    fn the_buttons_swatch_and_its_name_are_one_undo() {
+        let mut picker = picker(0, "ab");
+        press(&mut picker, &[ENTER, ENTER, ch('!'), ENTER]);
+        assert_eq!(picker.palette().at(0).map(Swatch::label), Some("colour 1!"));
+        assert!(picker.undo());
+        assert!(picker.palette().is_empty(), "gone in one");
+        assert!(!picker.undo(), "and nothing else was recorded");
+        assert!(picker.redo());
+        assert_eq!(picker.palette().at(0).map(Swatch::label), Some("colour 1!"), "back, named");
+    }
+
+    /// A name refused as it is kept — one another swatch has — leaves what came before it alone:
+    /// F2's new colour stays recorded, and undoes on its own once the naming is given up.
+    #[test]
+    fn a_name_refused_as_it_is_kept_leaves_the_colour_undoable() {
+        let mut picker = coloured(&[RED, BLUE], "ab");
+        press(&mut picker, &[F2, UP, ENTER, BACKSPACE, ch('1'), ENTER]); // "0" -> "1", taken
+        assert!(
+            picker.notice().is_some_and(|n| n.contains("not renamed")),
+            "{:?}",
+            picker.notice()
+        );
+        assert_eq!(picker.editing(), Some("1"), "still naming");
+        press(&mut picker, &[ESC]);
+        assert_ne!(picker.palette().at(0).map(Swatch::color), Some(RED.into()));
+        assert!(picker.undo(), "the colour is still there to take back");
+        assert_eq!(picker.palette().at(0).map(Swatch::color), Some(RED.into()));
+    }
+
+    /// An edit of two parts that cannot be undone WHOLE is not undone at all: here the colour F2
+    /// moved away from is taken meanwhile — by a caller changing the palette directly, which is
+    /// the only way it can be — and the name, which could have gone back, stays too, as does the
+    /// history. Replayed a part at a time, the name would have gone back on its own.
+    #[test]
+    fn an_edit_that_cannot_be_undone_whole_is_not_undone_at_all() {
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2, UP, ENTER, ch('!'), ENTER]);
+        picker.palette.push("intruder", RED).expect("RED is free now");
+        let (palette, done) = (picker.palette.clone(), picker.history.done.len());
+        assert_eq!(apply(&mut picker, UNDO), Action::Redraw, "the refusal is shown");
+        assert!(
+            picker.notice().is_some_and(|n| n.contains("cannot undo")),
+            "{:?}",
+            picker.notice()
+        );
+        assert_eq!(picker.palette, palette, "not the name, not the colour");
+        assert_eq!(picker.history.done.len(), done, "and still there to try again");
+    }
+
+    /// A stroke is replayed part by part in the order the parts were made — backwards to undo —
+    /// however deeply strokes nest, since a replay that nested one level and flattened the next
+    /// would take the parts of the inner one back in the wrong order.
+    #[test]
+    fn nested_strokes_are_replayed_in_order_both_ways() {
+        let paint = |x| Edit::Paint { x, y: 0, from: None, to: None };
+        let edit = Edit::Stroke(vec![
+            paint(0),
+            Edit::Stroke(vec![paint(1), Edit::Stroke(vec![paint(2)]), paint(3)]),
+            paint(4),
+        ]);
+        for (way, expected) in [(Way::Forward, [0, 1, 2, 3, 4]), (Way::Back, [4, 3, 2, 1, 0])] {
+            let mut seen = Vec::new();
+            edit.for_each_part(way, &mut |part| {
+                if let Edit::Paint { x, .. } = part {
+                    seen.push(*x);
+                }
+                Ok::<(), ()>(())
+            })
+            .expect("nothing refuses");
+            assert_eq!(seen, expected, "{way:?}");
+        }
+        assert!(!edit.moves_the_palette(), "paint alone asks nothing of the palette");
+    }
+
+    /// And the same going forward: a redo that would be refused half way is refused whole.
+    #[test]
+    fn an_edit_that_cannot_be_redone_whole_is_not_redone_at_all() {
+        let mut picker = coloured(&[RED], "ab");
+        press(&mut picker, &[F2, UP, ENTER, ch('!'), ENTER]);
+        assert!(picker.undo());
+        picker.palette.push("0!", BLUE).expect("the name is free now"); // where the rename goes
+        let palette = picker.palette.clone();
+        assert!(!picker.redo());
+        assert!(
+            picker.notice().is_some_and(|n| n.contains("cannot redo")),
+            "{:?}",
+            picker.notice()
+        );
+        assert_eq!(picker.palette, palette, "the colour did not move on its own");
     }
 
     /// The history holds labels, so a rename has to be carried into it — or undoing the button
@@ -5953,7 +6469,8 @@ mod tests {
     #[test]
     fn undoing_an_added_swatch_after_renaming_it_still_finds_it() {
         let mut picker = picker(0, "ab");
-        press(&mut picker, &[ENTER, ENTER]);
+        press(&mut picker, &[ENTER, ENTER, ENTER]); // added, as "colour 1"
+        press(&mut picker, &[F2, ENTER]); // later: the colour as it was, and a new name
         press(&mut picker, &vec![BACKSPACE; "colour 1".len()]);
         press(&mut picker, &[ch('s'), ENTER]);
         assert_eq!(picker.palette().at(0).unwrap().label(), "s");

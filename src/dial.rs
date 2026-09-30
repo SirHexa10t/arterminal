@@ -19,8 +19,16 @@
 //! to that, it holds exactly what it held. So a dial only looked at, or turned and turned back,
 //! hands back its colour to the bit — even a colour from a file that sits between the grid's
 //! points — and a visit that changed nothing recolours nothing.
+//!
+//! # Typing, as well as turning
+//!
+//! Digits type straight into the channel the arrows turn, and `#` types a whole colour in hex —
+//! no mode to switch into, because on a dial neither means anything else. A colour typed in hex
+//! is taken EXACTLY, and becomes what the channels go back to, so a colour a file holds, which
+//! turning may never land on, can always be named. See [`Dial::type_char`].
 
 use crate::color::{Hsb, Rgb};
+use std::fmt;
 
 /// Which of the three the dial is turning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +59,15 @@ impl Channel {
             Channel::Saturation | Channel::Brightness => 100,
         }
     }
+
+    /// The largest value it shows, and so the largest worth typing: 359 degrees, since 360 is 0
+    /// again, and 100 percent.
+    pub fn largest(self) -> u16 {
+        match self {
+            Channel::Hue => self.top() - 1,
+            Channel::Saturation | Channel::Brightness => self.top(),
+        }
+    }
 }
 
 /// A colour being chosen.
@@ -58,25 +75,48 @@ impl Channel {
 pub struct Dial {
     /// The colour it was given, exactly.
     start: Rgb,
-    /// What each channel goes back to holding when it is turned back to the value it showed at
-    /// first — see the module docs.
+    /// The colour the channels go back to when each shows what it showed there: the one it was
+    /// given, until a colour is typed in whole — see the module docs.
+    anchor: Rgb,
+    /// `anchor` as hue, saturation and brightness: what each channel goes back to holding.
     from: Hsb,
     hsb: Hsb,
     channel: Channel,
+    typing: Typing,
+}
+
+/// What is being typed into a dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typing {
+    Nothing,
+    /// A number, into the channel: the last three digits typed.
+    Number(u16),
+    /// A colour in hex, after its `#`: the digits so far, lower case.
+    Hex {
+        digits: [u8; 6],
+        len: usize,
+    },
 }
 
 impl Dial {
     /// A dial set to `start`, turning its hue.
     pub fn new(start: Rgb) -> Self {
         let from = start.to_hsb();
-        Self { start, from, hsb: from, channel: Channel::Hue }
+        Self {
+            start,
+            anchor: start,
+            from,
+            hsb: from,
+            channel: Channel::Hue,
+            typing: Typing::Nothing,
+        }
     }
 
-    /// The colour as dialled — exactly the colour it was given, while every channel shows what
-    /// it did at first.
+    /// The colour as dialled — exactly the colour it was given, or was last typed in whole, while
+    /// every channel shows what it did there.
     pub fn rgb(&self) -> Rgb {
         match self.hsb == self.from {
-            true => self.start,
+            true => self.anchor,
             false => Rgb::from_hsb(self.hsb),
         }
     }
@@ -98,8 +138,12 @@ impl Dial {
     }
 
     /// Move to the channel `by` places along — Left is -1, Right +1 — stopping at either end, as
-    /// the cursor does. `false` if it was already there.
+    /// the cursor does. `false` if it was already there, or a hex colour is half typed: see
+    /// [`Dial::end_typing`].
     pub fn select(&mut self, by: i32) -> bool {
+        if self.end_typing().is_err() {
+            return false;
+        }
         let at = Channel::ALL.iter().position(|c| *c == self.channel).expect("one of the three");
         let to = (at as i32 + by).clamp(0, Channel::ALL.len() as i32 - 1) as usize;
         self.channel = Channel::ALL[to];
@@ -107,8 +151,12 @@ impl Dial {
     }
 
     /// Turn the channel by `by` of its shown steps — degrees, or percent. Hue goes round;
-    /// saturation and brightness stop at 0 and 100. `false` if nothing moved.
+    /// saturation and brightness stop at 0 and 100. `false` if nothing moved, or a hex colour is
+    /// half typed: see [`Dial::end_typing`].
     pub fn turn(&mut self, by: i32) -> bool {
+        if self.end_typing().is_err() {
+            return false;
+        }
         let shown = self.shown(self.channel) as i32 + by;
         let to = match self.channel {
             Channel::Hue => shown.rem_euclid(Channel::Hue.top() as i32),
@@ -117,6 +165,132 @@ impl Dial {
         let before = self.hsb;
         self.hsb = set_shown(self.hsb, self.channel, to as u16, self.from);
         self.hsb != before
+    }
+
+    /// Type `c`: a digit into the channel's number, `#` to start typing a colour in hex, and then
+    /// that colour's digits, either case. `false` — nothing changed — for anything else.
+    ///
+    /// A NUMBER takes effect at every digit: `5` is 5 at once, and a `0` next makes it 50. Its
+    /// last three digits make it, so no keystroke is ever dropped; hue is taken round the circle,
+    /// 360 being 0, and saturation and brightness stop at 100. It ends at anything but a digit —
+    /// see [`Dial::end_typing`] — and the next digit starts a new one.
+    ///
+    /// A HEX colour takes effect when whole: at its sixth digit, or ended at its third as the
+    /// shorthand `#abc` for `#aabbcc`. The dial then holds that colour exactly, as its anchor.
+    pub fn type_char(&mut self, c: char) -> bool {
+        match self.typing {
+            Typing::Hex { mut digits, len } if c.is_ascii_hexdigit() => {
+                digits[len] = c.to_ascii_lowercase() as u8;
+                match len + 1 {
+                    6 => self.take(hex_colour(&digits)),
+                    len => self.typing = Typing::Hex { digits, len },
+                }
+                true
+            }
+            Typing::Hex { .. } => false,
+            _ if c == '#' => {
+                self.typing = Typing::Hex { digits: [0; 6], len: 0 };
+                true
+            }
+            typing => match c.to_digit(10) {
+                Some(digit) => {
+                    let so_far = match typing {
+                        Typing::Number(so_far) => so_far,
+                        _ => 0,
+                    };
+                    self.type_number((so_far * 10 + digit as u16) % 1000);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// Backspace, on what is being typed: a number loses its last digit — 12 becomes 1, and 1
+    /// becomes 0 — and a hex colour its last digit, then its `#`. `false` if nothing changed.
+    pub fn erase(&mut self) -> bool {
+        match self.typing {
+            Typing::Nothing => false,
+            Typing::Number(number) => {
+                let before = (self.typing, self.hsb);
+                self.type_number(number / 10);
+                (self.typing, self.hsb) != before
+            }
+            Typing::Hex { len: 0, .. } => {
+                self.typing = Typing::Nothing;
+                true
+            }
+            Typing::Hex { digits, len } => {
+                self.typing = Typing::Hex { digits, len: len - 1 };
+                true
+            }
+        }
+    }
+
+    /// End what is being typed, as every key but typing does: a number is simply done, and a hex
+    /// colour of three digits taken as the shorthand for six. `Ok(true)` if anything was being
+    /// typed. `Err` — still typing — for a hex colour of any other length, which is no colour yet:
+    /// finish it, take digits back, or give it up with [`Dial::drop_hex`].
+    pub fn end_typing(&mut self) -> Result<bool, UnfinishedHex> {
+        match self.typing {
+            Typing::Nothing => Ok(false),
+            Typing::Number(_) | Typing::Hex { len: 0, .. } => {
+                self.typing = Typing::Nothing;
+                Ok(true)
+            }
+            Typing::Hex { digits, len: 3 } => {
+                self.take(hex_colour(&digits[..3]));
+                Ok(true)
+            }
+            Typing::Hex { digits, len } => {
+                let typed = digits[..len].iter().map(|digit| *digit as char).collect();
+                Err(UnfinishedHex { typed })
+            }
+        }
+    }
+
+    /// Give up a hex colour half typed; the colour is as it was. `false` if none was.
+    pub fn drop_hex(&mut self) -> bool {
+        let typing_hex = matches!(self.typing, Typing::Hex { .. });
+        if typing_hex {
+            self.typing = Typing::Nothing;
+        }
+        typing_hex
+    }
+
+    /// Whether the channel's value is a number being typed, which the next digit goes on with.
+    pub fn is_typing_number(&self) -> bool {
+        matches!(self.typing, Typing::Number(_))
+    }
+
+    /// The digits of a hex colour being typed, after its `#`, while one is.
+    pub fn typed_hex(&self) -> Option<&str> {
+        match &self.typing {
+            Typing::Hex { digits, len } => {
+                Some(std::str::from_utf8(&digits[..*len]).expect("hex digits are ASCII"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Set the channel to what the number being typed says: hue round the circle, saturation and
+    /// brightness no further than 100.
+    fn type_number(&mut self, number: u16) {
+        self.typing = Typing::Number(number);
+        let to = match self.channel {
+            Channel::Hue => number % Channel::Hue.top(),
+            _ => number.min(self.channel.top()),
+        };
+        self.hsb = set_shown(self.hsb, self.channel, to, self.from);
+    }
+
+    /// Hold `rgb` exactly, as the colour the channels go back to — so turning away from a colour
+    /// typed in and back comes back to it to the bit, not to the nearest point of the grid.
+    fn take(&mut self, rgb: Rgb) {
+        self.anchor = rgb;
+        self.from = rgb.to_hsb();
+        self.hsb = self.from;
+        self.typing = Typing::Nothing;
     }
 
     /// A channel as shown: hue in degrees, 0-359; saturation and brightness in percent, 0-100.
@@ -171,6 +345,32 @@ impl Dial {
         let below_top = (top - self.shown(channel) as usize) * span;
         ((below_top + top / 2) / top).min(cells.saturating_sub(1))
     }
+}
+
+/// A hex colour ended half typed — neither three digits nor six — which is no colour yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedHex {
+    /// The digits typed after the `#`.
+    pub typed: String,
+}
+
+impl fmt::Display for UnfinishedHex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{} is not a colour yet: type three hex digits or six, or esc", self.typed)
+    }
+}
+
+impl std::error::Error for UnfinishedHex {}
+
+/// The colour hex `digits` name: six of them, or three as the shorthand `abc` for `aabbcc`.
+///
+/// The shorthand is taken only here, where it is TYPED. A file never takes it — see
+/// [`Rgb::from_hex`] for why — and never needs to: what is kept is the six digits it stands for.
+fn hex_colour(digits: &[u8]) -> Rgb {
+    let each = if digits.len() == 3 { 2 } else { 1 };
+    let text: String =
+        digits.iter().flat_map(|digit| [*digit as char; 2].into_iter().take(each)).collect();
+    Rgb::from_hex(&text).expect("three or six hex digits")
 }
 
 /// `channel` of `hsb` as shown. Hue by [`Hsb::degrees`], the crate's one conversion to degrees.
@@ -365,6 +565,163 @@ mod tests {
         assert_eq!(everything(&dial(30, 144, 255)), [true, true, true]);
         assert_eq!(everything(&dial(128, 128, 128)), [false, true, true], "a grey");
         assert_eq!(everything(&dial(0, 0, 0)), [false, false, true], "black");
+    }
+
+    // ---- typing ---------------------------------------------------------------------------------
+
+    fn typed(dial: &mut Dial, text: &str) {
+        for c in text.chars() {
+            assert!(dial.type_char(c), "{c:?} typed");
+        }
+    }
+
+    /// A number takes effect at every digit, into the channel the arrows turn.
+    #[test]
+    fn a_number_takes_effect_at_every_digit() {
+        let mut d = dial(255, 0, 0);
+        for (digit, shown) in [('1', 1), ('2', 12), ('0', 120)] {
+            assert!(d.type_char(digit));
+            assert_eq!(d.shown(Channel::Hue), shown);
+        }
+        assert!(d.is_typing_number());
+        assert_eq!(d.rgb(), Rgb::new(0, 255, 0), "120 degrees, green");
+    }
+
+    /// A number ends at anything but a digit, and the next digit starts a new one: 5, then 7, is
+    /// not 57 once something came between.
+    #[test]
+    fn a_number_ends_at_any_other_key_and_the_next_starts_afresh() {
+        let mut d = dial(255, 0, 0);
+        typed(&mut d, "5");
+        assert_eq!(d.end_typing(), Ok(true));
+        assert!(!d.is_typing_number());
+        typed(&mut d, "7");
+        assert_eq!(d.shown(Channel::Hue), 7);
+        assert!(d.select(1), "moving on ends it too");
+        typed(&mut d, "3");
+        assert_eq!((d.shown(Channel::Hue), d.shown(Channel::Saturation)), (7, 3));
+    }
+
+    /// No keystroke is dropped: the last three digits make the number, hue goes round the circle
+    /// and the other two stop at 100.
+    #[test]
+    fn the_last_three_digits_make_a_number() {
+        let mut d = dial(255, 0, 0);
+        typed(&mut d, "360");
+        assert_eq!(d.shown(Channel::Hue), 0, "360 is 0");
+        typed(&mut d, "4");
+        assert_eq!(d.shown(Channel::Hue), 604 % 360, "the last three digits: 604");
+        d.select(1);
+        for (digit, shown) in [('1', 1), ('2', 12), ('3', 100), ('4', 100)] {
+            typed(&mut d, &digit.to_string());
+            assert_eq!(d.shown(Channel::Saturation), shown, "after {digit}");
+        }
+    }
+
+    /// Every degree typed reads back as typed — typing lands on the same steps turning does.
+    #[test]
+    fn a_typed_degree_reads_back_as_typed() {
+        let mut d = dial(10, 20, 31);
+        for degree in 0..360 {
+            typed(&mut d, &degree.to_string());
+            assert_eq!(d.shown(Channel::Hue), degree);
+            d.end_typing().expect("a number always ends");
+        }
+    }
+
+    /// Backspace takes the last digit of a number back — 12 is 1, then 0 — and stops there.
+    #[test]
+    fn backspace_takes_back_a_numbers_last_digit() {
+        let mut d = dial(255, 0, 0);
+        assert!(!d.erase(), "nothing typed yet");
+        typed(&mut d, "12");
+        assert!(d.erase());
+        assert_eq!(d.shown(Channel::Hue), 1);
+        assert!(d.erase());
+        assert_eq!(d.shown(Channel::Hue), 0);
+        assert!(!d.erase(), "nothing left to take back");
+    }
+
+    /// A hex colour is taken exactly at its sixth digit, either case — and it is then what the
+    /// channels go back to: turned away and back, it comes back to the bit, even for a colour
+    /// the trip through hue, saturation and brightness changes.
+    #[test]
+    fn a_hex_colour_is_taken_exactly_and_turned_back_to_exactly() {
+        let indigo = Rgb::new(0x4b, 0x00, 0x82);
+        assert_ne!(Rgb::from_hsb(indigo.to_hsb()), indigo, "a colour the trip changes");
+        let mut d = dial(255, 0, 0);
+        typed(&mut d, "#4B008");
+        assert_eq!(d.typed_hex(), Some("4b008"), "lower case, as it will be written");
+        assert_eq!(d.rgb(), Rgb::new(255, 0, 0), "nothing taken until it is whole");
+        typed(&mut d, "2");
+        assert_eq!((d.rgb(), d.typed_hex()), (indigo, None));
+        assert!(d.is_changed());
+        for (at, channel) in Channel::ALL.into_iter().enumerate() {
+            d.select(-2);
+            d.select(at as i32);
+            // Back by as far as the number really went: a turn can stop at an end.
+            let before = d.shown(channel) as i32;
+            d.turn(-3);
+            d.turn(before - d.shown(channel) as i32);
+            assert_eq!(d.rgb(), indigo, "back to what was typed, turning {channel:?}");
+        }
+    }
+
+    /// Three digits, ended there, are the shorthand for six.
+    #[test]
+    fn three_hex_digits_ended_are_the_shorthand_for_six() {
+        let mut d = dial(0, 0, 0);
+        typed(&mut d, "#abc");
+        assert_eq!(d.end_typing(), Ok(true));
+        assert_eq!(d.rgb(), Rgb::new(0xaa, 0xbb, 0xcc));
+    }
+
+    /// A hex colour of any other length is no colour yet: it cannot be ended — nor turned or moved
+    /// away from — until it is finished, taken back to three, or given up.
+    #[test]
+    fn a_half_typed_hex_holds_until_finished_or_given_up() {
+        let mut d = dial(255, 0, 0);
+        typed(&mut d, "#1e9f");
+        let unfinished = d.end_typing().unwrap_err();
+        assert_eq!(unfinished.typed, "1e9f");
+        assert!(unfinished.to_string().contains("#1e9f is not a colour yet"), "{unfinished}");
+        assert!(!d.turn(1) && !d.select(1), "held");
+        assert!(d.erase());
+        assert_eq!(d.end_typing(), Ok(true), "three digits: the shorthand");
+        assert_eq!(d.rgb(), Rgb::new(0x11, 0xee, 0x99));
+        typed(&mut d, "#12");
+        assert!(d.drop_hex());
+        assert_eq!(d.rgb(), Rgb::new(0x11, 0xee, 0x99), "given up, the colour as it was");
+        assert!(!d.drop_hex(), "nothing more to give up");
+    }
+
+    /// Backspace in a hex colour takes back its digits, then its `#`.
+    #[test]
+    fn backspace_takes_back_a_hexs_digits_then_its_hash() {
+        let mut d = dial(0, 0, 0);
+        typed(&mut d, "#a");
+        assert!(d.erase());
+        assert_eq!(d.typed_hex(), Some(""));
+        assert!(d.erase());
+        assert_eq!(d.typed_hex(), None);
+        assert!(!d.erase());
+    }
+
+    /// Anything that is not typing is refused, and changes nothing: letters outside a hex
+    /// colour, a second `#` or a letter past `f` inside one.
+    #[test]
+    fn characters_that_do_not_type_are_refused() {
+        let mut d = dial(255, 0, 0);
+        let before = d;
+        for c in ['a', 'x', ' ', '-'] {
+            assert!(!d.type_char(c), "{c:?} outside a hex colour");
+        }
+        assert_eq!(d, before);
+        typed(&mut d, "#");
+        for c in ['#', 'g', ' '] {
+            assert!(!d.type_char(c), "{c:?} inside one");
+        }
+        assert_eq!(d.typed_hex(), Some(""));
     }
 
     // ---- the strips ----------------------------------------------------------------------------
