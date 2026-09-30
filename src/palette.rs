@@ -116,7 +116,9 @@ impl Palette {
         Ok(label)
     }
 
-    /// Take a swatch out, and hand it back.
+    /// Take a swatch out, and hand it back. Every swatch after it moves up a place — which the
+    /// crumpled form counts colours by, so the next crumpled save of the drawing rewrites every
+    /// colour line that numbers one of them; see [`crate::crumple`].
     ///
     /// Refused while anything still follows it — a derivation names its base by label, and a
     /// dangling one would resolve to nothing the next time its base was asked for. Whether any

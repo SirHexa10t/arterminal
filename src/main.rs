@@ -19,13 +19,16 @@ arterminal — colour a piece of ASCII art in the terminal
 ART.txt is text: one line per row, one character per cell, colours (if any) written inline as
 terminal escapes, and the palette after the art. A plain text file is a valid document with no
 colours and an empty palette. Every glyph must be exactly one terminal column wide, so no tabs,
-no emoji, no CJK — braille, block elements and box drawing are fine.
+no emoji, no CJK — braille, block elements and box drawing are fine. A file named .crumpled is a
+drawing's crumpled form, and opens as the drawing it holds; ^S then saves it as text, under its
+name without the .crumpled.
 
   --su   hold keys in any terminal: sudo opens the keyboards for this run only, and root is
          dropped as soon as they are open, before ART.txt is read. See below.
 
 Keys: ^X/esc close (twice if unsaved) · ^C quit, unsaved work kept in ART.txt.arterminal.tmp
       ^S save · ^Z undo · shift+^Z redo (^Y where the terminal cannot tell it from ^Z)
+      shift+^S or alt+s save a crumpled copy, ART.txt.crumpled, beside the file
       ↑↓←→ move · space/enter pick a swatch, add one on [+], or hold on a cell to paint
       backspace hold to erase · b / del toggle painting / erasing · F2 recolour & rename
       i pick up the colour under the cursor · [ ] shrink / grow the pen

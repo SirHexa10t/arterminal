@@ -254,6 +254,13 @@ pub enum LoadCause {
     Utf16,
     Canvas(CanvasError),
     Document(crate::document::DocumentError),
+    /// The file's name ends in `.crumpled`, and it is not a crumpled form this build can read —
+    /// see [`crate::crumple`].
+    Crumpled(crate::crumple::UncrumpleError),
+    /// The file IS a crumpled form, under a name that does not say so — renamed, most likely.
+    /// Refused rather than read as art: the crumpled text would become the picture, and a save
+    /// would then write it back over the drawing it stands for.
+    CrumpledUnnamed,
 }
 
 impl fmt::Display for LoadCause {
@@ -265,6 +272,12 @@ impl fmt::Display for LoadCause {
             }
             Self::Canvas(err) => err.fmt(f),
             Self::Document(err) => err.fmt(f),
+            Self::Crumpled(err) => err.fmt(f),
+            Self::CrumpledUnnamed => write!(
+                f,
+                "this is a crumpled drawing; to open it, give it a name ending in {:?}",
+                crate::crumple::SUFFIX
+            ),
         }
     }
 }
@@ -300,6 +313,8 @@ impl std::error::Error for LoadError {
             LoadCause::Utf16 => None,
             LoadCause::Canvas(err) => Some(err),
             LoadCause::Document(err) => Some(err),
+            LoadCause::Crumpled(err) => Some(err),
+            LoadCause::CrumpledUnnamed => None,
         }
     }
 }

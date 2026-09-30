@@ -33,7 +33,7 @@ never run together.
 ```rust
 use arterminal::Picker;
 
-let mut picker = Picker::open("examples/skull.txt")?;   // art, colours and palette, one file
+let mut picker = Picker::open("examples/small_braille_kirino.txt")?; // art, colours, palette
 arterminal::run(&mut picker)?;                           // Ctrl+S inside writes it back
 ```
 
@@ -44,7 +44,7 @@ without a terminal.
 **From the shell:**
 
 ```sh
-arterminal examples/skull.txt
+arterminal examples/small_braille_kirino.txt
 ```
 
 ## The binary's contract
@@ -82,7 +82,14 @@ shade<TAB>#a02020<TAB>ember<TAB>0,0,-60
   terminal's to say.
 * **A file with colours but no palette still loads**: every colour found gets a swatch with a
   counted name, because every colour in a drawing must have one.
-* **Rows are trimmed of trailing spaces on save**, so a ragged drawing stays ragged.
+* **What is saved reads back as the drawing it was**: every cell, its colour, and the drawing's
+  size. So rows are trimmed of trailing spaces, keeping a ragged drawing ragged — but a coloured
+  space is kept, since it may become a character and its colour must be there, and the longest row
+  keeps its spaces out to the drawing's full width. Painting a row past the longest can move that
+  padding to it, a two-line change. The width carried in spaces is the one thing text tools strip
+  — an editor or a hook that trims trailing whitespace will narrow a blank region, and an all-blank
+  drawing with it — though never lose a colour, which ends in an escape. The crumpled form, which
+  encodes those spaces, is unaffected.
 * Every glyph must be exactly one terminal column wide. Braille, box drawing and block elements
   are fine; emoji and CJK are rejected with a line and column. Tabs are refused.
 * **UTF-8 only.** A UTF-8 byte-order mark, which Windows editors like to write, is taken off; a
@@ -93,6 +100,65 @@ shade<TAB>#a02020<TAB>ember<TAB>0,0,-60
 
 The marker line is visible when the file is printed — a deliberate compromise, isolated in one
 module so it can be changed.
+
+## The crumpled form
+
+`Ctrl+Shift+S`, or `Alt+S` on any terminal, writes the drawing *crumpled* beside its file:
+`art.txt` gives `art.txt.crumpled`. It is an export: `art.txt` itself is not saved by it, and the
+status row still says `modified` until `Ctrl+S` saves it. A drawing opened from a `.crumpled` file
+is read as the drawing it holds, and `Ctrl+S` saves it as text, under its name without the
+`.crumpled` — a save is always plain — while `Alt+S` crumples it back, adding no second suffix.
+
+The crumpled form is for keeping drawings in a repository. It is text, a line for each row of the
+drawing, so git diffs, merges and blames it the way it does the drawing: paint one row, and one
+line of the crumpled form changes. That rule costs compression — a whole-file compressor gets
+further on the same art, because the likeness of one row to the next is real — and it is kept on
+purpose, since a repository of opaque blobs is one nobody can review. What every version keeps,
+pinned by tests:
+
+* **Lossless.** Crumpled and uncrumpled, a text comes back byte for byte, whatever it holds.
+* **Line by line.** Each row is a line, made from that row alone, with at most tables the whole
+  drawing shares.
+* **Never larger** than the text as it is.
+* **Versioned.** The header, `=== arterminal crumpled 1 ===`, names the version. Each version
+  reads every earlier one; one newer than the build reading it is refused by name, and a damaged
+  file is refused by line, never guessed at.
+
+**Version 1** holds a drawing as two planes. Its characters are Huffman coded, with runs of one
+character shortened, one table for the drawing and a base64 line for each row. Its colours are a
+line for each row of runs of palette numbers, and its palette is kept as the document has it,
+readable. On the examples, as the picker saves them:
+
+| Drawing | Saved | Crumpled |
+|---|---|---|
+| `long_ascii_anime_postergirl.txt` | 13,430 B | 3,899 B (−71%) |
+| `small_filled_blocks_miku.txt` | 6,433 B | 1,138 B (−82%) |
+| `small_braille_kirino.txt` | 1,105 B | 480 B (−57%) |
+
+What changes when the drawing does: painting a row changes its colour line; a swatch recoloured,
+renamed or added, its palette line. The picker never changes a character — only colours — so the
+character table changes only when the art itself is replaced. Version 1 is written only for a
+document exactly as this crate writes it, and is rebuilt through the same writer when read, so
+there is one writer of documents, not two; a test pins the writer's spelling, so it cannot change
+without the version changing too. Any other text — a hand-made file, say — is written as
+**version 0**, the text line for line as it is.
+
+For a program keeping drawings, the library does it with text in and text out:
+
+```rust
+use arterminal::crumple;
+use std::path::Path;
+
+let text = std::fs::read_to_string("art.txt")?;    // a drawing's document, as saved
+let crumpled = crumple::crumple(&text);            // what a .crumpled file holds
+assert_eq!(crumple::uncrumple(&crumpled)?, text);  // and back, exactly
+let beside = crumple::crumpled_path(Path::new("art.txt")); // art.txt.crumpled
+std::fs::write(beside, crumpled)?;
+```
+
+`document::read` and `document::write` take the form from the file's name. A `.crumpled` name on a
+file that is not crumpled is refused, and so is a crumpled file under a plain name: read as art,
+its crumpled text would become the picture, and a save would write that back over the drawing.
 
 ## Keys
 
@@ -112,7 +178,8 @@ module so it can be changed.
 | `F6` | split the art into a solid-colour canvas over a coloured preview, or join it back |||
 | `Shift+F6` | the same split, side by side, or join it back |||
 | `c` | in a split, show or hide the cursor on the preview |||
-| `Ctrl+S` | save to the file it was opened from |||
+| `Ctrl+S` | save, as text, to the file it was opened from — without the `.crumpled`, if that was a crumpled one |||
+| `Ctrl+Shift+S` / `Alt+S` | save a crumpled copy beside it, `<file>.crumpled` — see [The crumpled form](#the-crumpled-form). `Alt+S` works on every terminal |||
 | `Ctrl+Z` / `Ctrl+Shift+Z` | undo / redo — hold to keep going; a whole drag is one undo. `Ctrl+Y` redoes too, on every terminal |||
 | `Ctrl+X` / `Esc` | close — warns first if there is unsaved work, closes on the second press |||
 | `Ctrl+C` | quit at once — unsaved work is kept in `<file>.arterminal.tmp` |||
@@ -259,18 +326,19 @@ When no device ever shows the key behind a press, arterminal says so once and th
 | `src/cursor.rs` | `Focus` and `Dir`: where the cursor is, and where a key sends it. |
 | `src/dial.rs` | `Dial`: a colour chosen by hue, saturation and brightness, a step at a time. Pure. |
 | `src/keys.rs` | Bytes from the terminal into key events — presses, repeats, releases. Pure. |
-| `src/document.rs` | The file format: art with inline colours, then the palette. Parse and render, pure. |
+| `src/document.rs` | The file format: art with inline colours, then the palette. Parse and render, pure; read and write, in the form the file's name says. |
+| `src/crumple.rs` | The crumpled form: a document smaller, still a line per row for git. Text in, text out; pure. The contract, the versions, the header. |
+| `src/crumple/` | Its version 1: `planes.rs` the format, `huffman.rs` canonical codes, `base64.rs` bits and numbers as text. |
 | `src/ui.rs` | `Picker` — brush, pen, naming, undo history, save/salvage — and `render`, `apply`, `run`. |
 | `src/paint.rs` | Getting a frame onto the terminal without flicker. **Ported** — see below. |
 | `src/input.rs` | Raw mode, the waits and reads, keystroke coalescing (**ported**), and the keyboard-protocol guard. |
 | `src/devices.rs` | Key releases from `/dev/input`, for terminals that report none. Polls which keys are down; never reads keystrokes. |
 | `src/elevate.rs` | `--su`: sudo for one run, the keyboards opened, root given back and the drop verified. Linux only. |
 | `src/main.rs` | The standalone binary. |
-| `examples/skull.txt` | Sample art. |
+| `examples/` | Sample art: braille, colour on filled blocks, and a long plain poster. |
 | `tests/stderr_gate.rs` | The one test that must write `console`'s process-wide colour switches, kept in its own process. |
 | `tests/no_colour.rs` | The picker with styling switched off — the dial draws no strips — in a process of its own for the same reason. |
-| `tests/pty.rs` | The real binary on a pseudo-terminal, with the test playing the terminal: holding, saving, salvage, `--su` without a terminal, the startup questions, width measuring, the colour dial. |
-| `*_img_test.txt` | Sample art at two sizes. |
+| `tests/pty.rs` | The real binary on a pseudo-terminal, with the test playing the terminal: holding, saving, salvage, `--su` without a terminal, the startup questions, width measuring, the colour dial, the crumpled save. |
 
 ## Design notes
 
@@ -406,6 +474,9 @@ Plain-text art loads with no ink anywhere.
 
 ## Not yet built
 
+* **More out of the crumpled form.** The likeness of a row to the row above it is most of what a
+  whole-file compressor gets that version 1 does not; taking it would make an edit change two lines
+  rather than one.
 * **Derived swatches in the UI.** The palette and the file support them; nothing creates one yet.
 * **Removing a swatch by hand.** Only undo removes one today.
 * **A signal handler** restoring raw mode and the keyboard flags on `SIGTERM` — see above.

@@ -10,7 +10,8 @@
 //! unique colour. A cell holds its [`Rgb`] directly, which is what makes a canvas printable as it
 //! stands; editing a swatch still recolours the drawing, by rewriting every cell holding that
 //! colour — see [`Picker::set_swatch_color`]. A [`Picker`] puts the two together and lets someone
-//! walk over both with the arrow keys.
+//! walk over both with the arrow keys. A drawing's document can also be [`crumple`]d: made
+//! smaller, and still a line of text per line of drawing, for keeping drawings in a repository.
 //!
 //! ```no_run
 //! use arterminal::Picker;
@@ -70,6 +71,7 @@
 
 pub mod canvas;
 pub mod color;
+pub mod crumple;
 pub mod cursor;
 pub mod dial;
 pub mod document;
@@ -84,6 +86,7 @@ mod paint;
 
 pub use crate::canvas::{At, Canvas, CanvasError, Cell, LoadCause, LoadError};
 pub use crate::color::{ColorParseError, Hsb, Ink, Rgb, Rng};
+pub use crate::crumple::UncrumpleError;
 pub use crate::cursor::{Dir, Focus};
 pub use crate::devices::InputDevices;
 pub use crate::dial::{Channel, Dial, UnfinishedHex};

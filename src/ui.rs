@@ -4,8 +4,8 @@
 //!
 //! * [`render`] turns a [`Picker`] into lines of text. Pure.
 //! * [`apply`] turns a keystroke into a change to that state. Pure — it never touches a file or
-//!   a terminal; the one thing a key can ask for that needs either, saving, comes back to the
-//!   caller as [`Action::Save`].
+//!   a terminal; what a key can ask for that needs either — saving, crumpled or not, and a
+//!   redraw — comes back to the caller as an [`Action`].
 //! * [`run`] is the small impure loop that connects the two to a terminal.
 //!
 //! Everything that decides what appears lives in the first two, so the picker can be tested
@@ -151,13 +151,14 @@ impl Picker {
 
     /// [`Picker::open`] for a file already read — by [`document::read`], say, so that it could
     /// be [measured](document::measure) first. `path` is where it came from, and where a save
-    /// will go.
+    /// will go — with any `.crumpled` taken off, since a save writes the drawing plain; see
+    /// [`Picker::save`].
     pub fn from_text(path: impl AsRef<Path>, text: &str) -> Result<Self, LoadError> {
         let path = path.as_ref();
         let at = |source| LoadError { path: path.to_path_buf(), source };
         let doc = document::parse(text).map_err(|err| at(LoadCause::Document(err)))?;
         let mut picker = Self::new(doc.canvas).with_palette(doc.palette);
-        picker.path = Some(path.to_path_buf());
+        picker.path = Some(crate::crumple::plain_path(path));
         Ok(picker)
     }
 
@@ -860,7 +861,10 @@ impl Picker {
         }
     }
 
-    /// Write the document back to the path it was opened from.
+    /// Ctrl+S: write the document back, PLAIN, to the file it was opened from — or, when that was
+    /// its crumpled form, to the plain one it is of, `art.txt` for `art.txt.crumpled`. A save is
+    /// always of the drawing as text a person can read; [`Picker::save_crumpled`] writes the
+    /// other form.
     pub fn save(&mut self) -> std::io::Result<PathBuf> {
         let Some(path) = self.path.clone() else {
             return Err(std::io::Error::other("this picker was not opened from a file"));
@@ -870,13 +874,36 @@ impl Picker {
     }
 
     /// Write the document to `path`, and remember it as the place to save from now on.
+    ///
+    /// Crumpled when the name ends in `.crumpled`, since a name and what it holds must agree —
+    /// see [`document::write`] — and then what is remembered is the plain document it is of, and
+    /// the drawing is not counted saved: whether it is, is the plain file's to say.
     pub fn save_to(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.lift_pen();
         let path = path.as_ref();
-        std::fs::write(path, document::render(&self.canvas, &self.palette))?;
-        self.path = Some(path.to_path_buf());
-        self.history.mark_saved();
+        document::write(path, &self.canvas, &self.palette)?;
+        self.path = Some(crate::crumple::plain_path(path));
+        if !crate::crumple::is_crumpled_path(path) {
+            self.history.mark_saved();
+        }
         Ok(())
+    }
+
+    /// Alt+S, or Ctrl+Shift+S: write the drawing crumpled — see [`crate::crumple`] — beside its
+    /// plain file, under its name with `.crumpled` added once. Says where it went.
+    ///
+    /// An EXPORT, always: the plain file saves go to stays as it was, and so does whether the
+    /// drawing is behind — a crumpled copy saves nothing the person has not saved. So a drawing
+    /// opened from its crumpled form and crumpled back to it is still behind, until [`Picker::save`]
+    /// writes it plain.
+    pub fn save_crumpled(&mut self) -> std::io::Result<PathBuf> {
+        let Some(path) = self.path.clone() else {
+            return Err(std::io::Error::other("this picker was not opened from a file"));
+        };
+        let crumpled = crate::crumple::crumpled_path(&path);
+        self.lift_pen();
+        document::write(&crumpled, &self.canvas, &self.palette)?;
+        Ok(crumpled)
     }
 }
 
@@ -899,7 +926,7 @@ impl Picker {
         if !self.is_dirty() {
             return Ok(None);
         }
-        std::fs::write(&path, document::render(&self.canvas, &self.palette))?;
+        document::write(&path, &self.canvas, &self.palette)?;
         Ok(Some(path))
     }
 }
@@ -1580,7 +1607,11 @@ pub enum Outcome {
 }
 
 /// What a keystroke did.
+///
+/// `non_exhaustive`, as [`Outcome`] is: a program driving [`apply`] itself handles the actions it
+/// knows, and a new one does not break it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Action {
     /// State or the cursor moved; the frame needs drawing again.
     Redraw,
@@ -1592,6 +1623,9 @@ pub enum Action {
     /// The user asked for the document to be written. [`apply`] does not do it — it touches no
     /// file — so the caller must, and then say how it went through the picker's notice.
     Save,
+    /// The user asked for the drawing to be written crumpled: see [`Picker::save_crumpled`]. As
+    /// with [`Action::Save`], the caller writes it, and says how it went.
+    SaveCrumpled,
     /// F5: clear the terminal and draw everything afresh. [`apply`] does not do it — it touches
     /// no terminal — so the caller must.
     Refresh,
@@ -2406,17 +2440,20 @@ fn hint_line(title: &str, hints: &[Hint], ink: console::Color, width: usize, wid
 fn file_hints(picker: &Picker) -> Vec<Hint> {
     // Named the way this terminal can send it: see the redo arm of [`apply`].
     let redo = if picker.shift_on_ctrl { "shift+^Z" } else { "^Y" };
+    let crumple = if picker.shift_on_ctrl { "shift+^S" } else { "alt+s" };
     match picker.editing.is_some() || picker.colour_edit.is_some() {
         // Esc gives up the name or the colour while one is chosen, and everything else waits —
         // but the interrupt.
         true => vec![("^C", "quit")],
         false => {
+            // The crumpled save last: the one of these a person reaches for least.
             vec![
                 ("^X/esc", "close"),
                 ("^C", "quit"),
                 ("^S", "save"),
                 ("^Z", "undo"),
                 (redo, "redo"),
+                (crumple, "crumple"),
             ]
         }
     }
@@ -2661,7 +2698,9 @@ fn tail(line: &str, from: usize, wide: bool) -> String {
 /// - While a name is being typed, keys type, `Backspace` deletes, `Enter` keeps it, `Esc` gives
 ///   it up. Nothing else acts until one of those. A name given straight after the dial is one
 ///   undo with the colour; see [`Picker::commit_rename`].
-/// - `Ctrl+S` asks for a save — asks, because this function touches no file.
+/// - `Ctrl+S` asks for a save — asks, because this function touches no file. `Ctrl+Shift+S`
+///   asks for a crumpled one where the terminal can tell it from `Ctrl+S`, and `Alt+S` does
+///   everywhere; see [`Picker::save_crumpled`].
 /// - `Ctrl+Z` undoes, repeatedly if held. `Ctrl+Shift+Z` redoes where the terminal can tell it
 ///   from `Ctrl+Z` — one speaking the kitty keyboard protocol reports the Shift — and `Ctrl+Y`
 ///   redoes everywhere, because a classic terminal sends the identical byte for `Ctrl+Shift+Z` as
@@ -2720,6 +2759,19 @@ pub fn apply(picker: &mut Picker, event: impl Into<KeyEvent>) -> Action {
         match event.code {
             KeyCode::Escape if pressed => close_requested(picker, armed),
             KeyCode::Char('x') if pressed && event.is_ctrl('x') => close_requested(picker, armed),
+            // A crumpled save is Ctrl+Shift+S wherever it can be told from Ctrl+S — the kitty
+            // keyboard protocol reports the Shift — and Alt+S everywhere, because a classic
+            // terminal sends one byte for both Ctrl chords, and there Ctrl+Shift+S can only save.
+            KeyCode::Char('s' | 'S') if pressed && event.mods.ctrl && event.mods.shift => {
+                if event.mods.alt {
+                    Action::Ignored
+                } else {
+                    Action::SaveCrumpled
+                }
+            }
+            KeyCode::Char('s' | 'S') if pressed && event.mods.alt && !event.mods.ctrl => {
+                Action::SaveCrumpled
+            }
             KeyCode::Char('s') if pressed && event.is_ctrl('s') => Action::Save,
             // Redo is Ctrl+Shift+Z wherever it can be told from Ctrl+Z — the kitty keyboard
             // protocol reports the Shift — and Ctrl+Y everywhere, because a classic terminal
@@ -3154,6 +3206,12 @@ pub fn run_with_devices(
                 picker.notice = Some(match picker.save() {
                     Ok(path) => format!("saved to {}", path.display()),
                     Err(err) => format!("not saved: {err}"),
+                });
+            }
+            Action::SaveCrumpled => {
+                picker.notice = Some(match picker.save_crumpled() {
+                    Ok(path) => format!("crumpled to {}", path.display()),
+                    Err(err) => format!("not crumpled: {err}"),
                 });
             }
             // Clear everything, then draw from the top as if for the first time. The one place a
@@ -4156,6 +4214,9 @@ mod tests {
         b"e",
         b"\x1b[51;2;35u",
         b"\t",
+        // The crumpled save, both ways a terminal sends it.
+        b"\x1b[115;6u",
+        b"\x1bs",
     ];
 
     /// A fixed corpus of random sessions — random art, palettes, key streams and terminal sizes,
@@ -4406,6 +4467,46 @@ mod tests {
     fn ctrl_s_asks_for_a_save_rather_than_doing_one() {
         let mut picker = picker(1, "ab");
         assert_eq!(apply(&mut picker, SAVE), Action::Save);
+    }
+
+    /// A crumpled save is asked for with Ctrl+Shift+S where the terminal can tell it from Ctrl+S,
+    /// and with Alt+S anywhere — from the bytes terminals really send. Asked for, not done: this
+    /// function touches no file. Held, it asks once; with every modifier at once, not at all.
+    #[test]
+    fn ctrl_shift_s_and_alt_s_ask_for_a_crumpled_save() {
+        let mut picker = picker(1, "ab");
+        for (bytes, action) in [
+            (&b"\x1b[115;6u"[..], Action::SaveCrumpled), // kitty: Ctrl+Shift+S
+            (b"\x1bs", Action::SaveCrumpled),            // classic: Alt+S
+            (b"\x1b[115;3u", Action::SaveCrumpled),      // kitty: Alt+S
+            (b"\x13", Action::Save),                     // classic: Ctrl+S — or Ctrl+Shift+S
+            (b"\x1b[115;5u", Action::Save),              // kitty: Ctrl+S
+            (b"\x1b[115;6:2u", Action::Ignored),         // kitty: Ctrl+Shift+S, held
+            (b"\x1b[115;8u", Action::Ignored),           // kitty: Ctrl+Alt+Shift+S
+        ] {
+            assert_eq!(type_bytes(&mut picker, bytes), action, "{bytes:?}");
+        }
+    }
+
+    /// Nor while a name is typed or a colour dialled, when a save of a half-done edit is not what
+    /// anyone asked for.
+    #[test]
+    fn no_crumpled_save_is_asked_for_mid_edit() {
+        let mut picker = picker(1, "ab");
+        press(&mut picker, &[F2]);
+        assert_eq!(type_bytes(&mut picker, b"\x1bs"), Action::Ignored, "dialling");
+        press(&mut picker, &[ENTER]);
+        assert_eq!(type_bytes(&mut picker, b"\x1b[115;6u"), Action::Ignored, "naming");
+        assert_eq!(picker.editing(), Some("colour 1"), "and nothing was typed");
+    }
+
+    /// The hint names the crumpled save the way this terminal can send it.
+    #[test]
+    fn the_crumpled_save_is_hinted_as_this_terminal_sends_it() {
+        let mut picker = picker(1, "ab");
+        assert!(hints(&picker).contains("alt+s crumple"), "{}", hints(&picker));
+        picker.set_shift_on_ctrl(true);
+        assert!(hints(&picker).contains("shift+^S crumple"), "{}", hints(&picker));
     }
 
     /// `RawMode` turns off signal generation, so Ctrl+C arrives as a keystroke and nothing else
@@ -6553,6 +6654,72 @@ mod tests {
         assert!(picker.save().is_err());
         assert_eq!(picker.salvage_path(), None);
         assert_eq!(picker.salvage().expect("nothing to write is not an error"), None);
+    }
+
+    /// A crumpled save writes the drawing's crumpled form beside its file, and saves nothing
+    /// else: the file itself is as it was, and the picker still says it is behind — a crumpled
+    /// copy of unsaved work is not the work saved. What was written opens as the drawing.
+    #[test]
+    fn a_crumpled_save_is_an_export_beside_the_file() {
+        let dir = std::env::temp_dir().join(format!("arterminal-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("art.txt");
+        std::fs::write(&path, "ab\ncd\n").expect("write");
+        let mut picker = Picker::open(&path).expect("opens");
+        press(&mut picker, &[ENTER, ENTER, ENTER, ENTER]); // a colour: dial, keep, name; brush
+        picker.set_focus(Focus::Cell { x: 0, y: 0 });
+        press(&mut picker, &[SPACE]);
+
+        let crumpled = picker.save_crumpled().expect("writes");
+        assert_eq!(crumpled, dir.join("art.txt.crumpled"));
+        let reopened = Picker::open(&crumpled).expect("the crumpled copy opens");
+        assert_eq!(reopened.canvas(), picker.canvas(), "the drawing, as it is now");
+        assert_eq!(reopened.palette(), picker.palette());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab\ncd\n", "the file is untouched");
+        assert!(picker.is_dirty(), "and still behind");
+        assert_eq!(picker.path(), Some(path.as_path()), "saves still go where they went");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A drawing opened from its crumpled form, with no plain file beside it, saves PLAIN with
+    /// Ctrl+S — to its name without `.crumpled`, as text a person can read, which is from then on
+    /// the file saves go to — and crumpled with Alt+S, back to the file it came from, the suffix
+    /// added once. The crumpled copy is an export either way: only the plain save saves.
+    #[test]
+    fn a_drawing_opened_crumpled_saves_plain_under_its_plain_name() {
+        let dir = std::env::temp_dir().join(format!("arterminal-crumpled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (crumpled, plain) = (dir.join("art.txt.crumpled"), dir.join("art.txt"));
+        std::fs::write(&crumpled, crate::crumple::crumple("ab\ncd\n")).expect("write");
+        let mut picker = Picker::open(&crumpled).expect("opens");
+        assert_eq!(picker.canvas().width(), 2, "read as the drawing it holds");
+        assert_eq!(picker.path(), Some(plain.as_path()), "saves go to the plain name");
+        press(&mut picker, &[ENTER, ENTER, ENTER, ENTER]); // a colour, kept and named; brush
+        picker.set_focus(Focus::Cell { x: 1, y: 1 });
+        press(&mut picker, &[SPACE]);
+
+        assert_eq!(picker.save_crumpled().expect("writes"), crumpled, "the suffix once, not twice");
+        let on_disk = std::fs::read_to_string(&crumpled).expect("readable");
+        assert!(crate::crumple::is_crumpled(&on_disk), "crumpled: {on_disk:?}");
+        assert!(picker.is_dirty() && !plain.exists(), "a crumpled copy saves nothing plain");
+
+        assert_eq!(picker.save().expect("writes"), plain);
+        let on_disk = std::fs::read_to_string(&plain).expect("readable");
+        assert!(!crate::crumple::is_crumpled(&on_disk), "plain text: {on_disk:?}");
+        assert!(!picker.is_dirty(), "and that is a save");
+        for path in [&plain, &crumpled] {
+            assert_eq!(Picker::open(path).expect("reopens").canvas(), picker.canvas(), "{path:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A picker with no file behind it has nowhere to write a crumpled copy beside, and says so.
+    #[test]
+    fn a_crumpled_save_needs_a_file_to_go_beside() {
+        let mut picker = picker(1, "ab");
+        let why = picker.save_crumpled().expect_err("nowhere to go");
+        assert!(why.to_string().contains("not opened from a file"), "{why}");
     }
 
     /// The whole feature through the file: paint, save, reopen, and find it as it was left.

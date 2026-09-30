@@ -44,6 +44,7 @@
 
 use crate::canvas::{Canvas, CanvasError, Cell};
 use crate::color::{Ink, Rgb};
+use crate::crumple;
 use crate::palette::{HsbOffset, Palette, PaletteError};
 use std::fmt;
 
@@ -86,11 +87,38 @@ pub fn parse(text: &str) -> Result<Document, DocumentError> {
 /// The text of the file at `path`, as every loader here reads it — see [`Picker::open`] for the
 /// usual way in. Public for a caller that wants to [`measure`] a file before it builds anything.
 ///
+/// The document's text whatever form its file is in: a file whose name ends in
+/// [`crumple::SUFFIX`] is read through [`crumple::uncrumple`], so nothing after this ever sees a
+/// crumpled form. The NAME decides, not the content — so a plain drawing whose first row happens
+/// to read like a crumpled header is still a plain drawing. Content is still looked at the other
+/// way round: a crumpled form under a plain name is refused, since read as art it would become
+/// the picture, and a save would write it back as one.
+///
 /// [`Picker::open`]: crate::Picker::open
 pub fn read(path: impl AsRef<std::path::Path>) -> Result<String, crate::LoadError> {
     let path = path.as_ref();
-    crate::canvas::read_text(path)
-        .map_err(|source| crate::LoadError { path: path.to_path_buf(), source })
+    let at = |source| crate::LoadError { path: path.to_path_buf(), source };
+    let text = crate::canvas::read_text(path).map_err(at)?;
+    match crumple::is_crumpled_path(path) {
+        true => crumple::uncrumple(&text).map_err(|why| at(crate::LoadCause::Crumpled(why))),
+        false if crumple::is_crumpled(&text) => Err(at(crate::LoadCause::CrumpledUnnamed)),
+        false => Ok(text),
+    }
+}
+
+/// Write the drawing to `path` as its document — see [`render`] — crumpled when the name ends in
+/// [`crumple::SUFFIX`], as [`read`] expects to find it.
+pub fn write(
+    path: impl AsRef<std::path::Path>,
+    canvas: &Canvas,
+    palette: &Palette,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let text = render(canvas, palette);
+    match crumple::is_crumpled_path(path) {
+        true => std::fs::write(path, crumple::crumple(&text)),
+        false => std::fs::write(path, text),
+    }
 }
 
 /// How big a document's drawing is.
@@ -170,18 +198,14 @@ fn split<'a, 'b>(lines: &'b [&'a str]) -> (&'b [&'a str], &'b [&'a str], usize) 
     }
 }
 
-/// Write a document as the text of a file.
-///
-/// Rows are trimmed of trailing spaces before writing, whatever ink those spaces carried: a
-/// foreground colour on a space draws nothing, so the ink was never visible, and keeping the
-/// spaces would pad every row of a ragged drawing out to the widest — a diff on every line of a
-/// file that was only opened.
+/// Write a document as the text of a file — one a reader gives back as the same drawing, every
+/// cell, its colour and the drawing's size. Each row is written up to its last character or
+/// colour, and the longest out to the drawing's full width; a ragged drawing stays ragged.
 pub fn render(canvas: &Canvas, palette: &Palette) -> String {
     let mut out = String::new();
-    for row in canvas.rows() {
-        let end = row.iter().rposition(|cell| cell.glyph != ' ').map_or(0, |at| at + 1);
+    for row in written_rows(canvas) {
         let mut ink = None;
-        for cell in &row[..end] {
+        for cell in row {
             if cell.ink != ink {
                 out.push_str(&sgr(cell.ink));
                 ink = cell.ink;
@@ -221,6 +245,40 @@ pub fn render(canvas: &Canvas, palette: &Palette) -> String {
 /// fewer bytes: `38;5;n` is how the picker DRAWS a slot, and some terminals give the two spellings
 /// of one of the first sixteen different colours — so this is the spelling in which what was
 /// saved is what was seen.
+/// The cells of each of `canvas`'s rows that its document writes, so that reading it back gives
+/// the same drawing: every row up to its last cell that is a character or coloured, and the
+/// longest of them out to the canvas's full width, so the drawing comes back the size it was.
+///
+/// What follows a row's last such cell is padding — every row of a canvas is made as wide as the
+/// widest — and a drawing written without it stays as ragged as it was drawn. Writing every row
+/// out to the width was the alternative, and would put a diff on every line of a ragged file that
+/// was only opened and saved; one row carries the width instead.
+///
+/// A coloured space is kept, though a colour on a space draws nothing — which is why spaces were
+/// once trimmed whatever their ink. The colour is the drawing's all the same: the space may be
+/// made a character later, by hand or by a tool, and then its colour must be there to show.
+///
+/// [`crate::crumple`] keeps to this too, so it and the writer cannot come to disagree.
+pub(crate) fn written_rows(canvas: &Canvas) -> Vec<&[Cell]> {
+    let full: Vec<&[Cell]> = canvas.rows().collect();
+    let mut rows: Vec<&[Cell]> = full
+        .iter()
+        .map(|row| {
+            let end = row.iter().rposition(|cell| cell.glyph != ' ' || cell.ink.is_some());
+            &row[..end.map_or(0, |at| at + 1)]
+        })
+        .collect();
+    // The first of the longest — out to the width, which it already is unless the widest row the
+    // drawing was made from ended in spaces, or every row is blank.
+    let longest =
+        (0..rows.len())
+            .fold(0, |best, at| if rows[at].len() > rows[best].len() { at } else { best });
+    if let Some(row) = full.get(longest) {
+        rows[longest] = row;
+    }
+    rows
+}
+
 fn sgr(ink: Option<Ink>) -> String {
     match ink {
         Some(Ink::Rgb(Rgb { r, g, b })) => format!("\x1b[38;2;{r};{g};{b}m"),
@@ -533,6 +591,67 @@ mod tests {
     const RED: Rgb = Rgb::new(226, 57, 57);
     const BLUE: Rgb = Rgb::new(57, 144, 226);
 
+    // ---- the crumpled form, by name ------------------------------------------------------------
+
+    /// A directory of its own for a test that writes files, emptied first.
+    fn scratch(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("arterminal-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    fn a_drawing() -> (Canvas, Palette) {
+        let mut palette = Palette::new();
+        palette.push("ember", RED).expect("fresh");
+        (inked("ab\ncd", &[((1, 0), RED)]), palette)
+    }
+
+    /// What `write` puts under a `.crumpled` name, `read` gives back as the document it holds —
+    /// and the file itself is the crumpled form, not the document.
+    #[test]
+    fn a_crumpled_file_reads_back_as_the_document_it_holds() {
+        let dir = scratch("crumpled-read");
+        let (canvas, palette) = a_drawing();
+        let path = dir.join("art.txt.crumpled");
+        write(&path, &canvas, &palette).expect("writes");
+        let on_disk = std::fs::read_to_string(&path).expect("readable");
+        assert!(crumple::is_crumpled(&on_disk), "crumpled on disk: {on_disk:?}");
+        assert_eq!(read(&path).expect("reads"), render(&canvas, &palette));
+        let plain = dir.join("art.txt");
+        write(&plain, &canvas, &palette).expect("writes");
+        assert_eq!(std::fs::read_to_string(&plain).expect("readable"), render(&canvas, &palette));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The name and the content must agree, both ways: a `.crumpled` name on a plain document,
+    /// or a version this build cannot read, is refused as not crumpled — and a crumpled form under
+    /// a plain name is refused too, rather than read as the art it stands for, which a save would
+    /// then write back over the drawing.
+    #[test]
+    fn a_crumpled_name_and_a_crumpled_form_must_agree() {
+        let dir = scratch("crumpled-names");
+        let (canvas, palette) = a_drawing();
+        let plain_text = render(&canvas, &palette);
+        let cases = [
+            ("plain.crumpled", plain_text.clone(), "not a crumpled drawing"),
+            ("newer.crumpled", "=== arterminal crumpled 7 ===\nab\n".to_string(), "\"7\""),
+            ("renamed.txt", crumple::crumple(&plain_text), ".crumpled"),
+        ];
+        for (name, text, says) in cases {
+            let path = dir.join(name);
+            std::fs::write(&path, text).expect("writes");
+            let refused = read(&path).expect_err(name);
+            let expected_cause = match name {
+                "renamed.txt" => matches!(refused.source, crate::LoadCause::CrumpledUnnamed),
+                _ => matches!(refused.source, crate::LoadCause::Crumpled(_)),
+            };
+            assert!(expected_cause, "{name}: {refused:?}");
+            assert!(refused.to_string().contains(says), "{name}: {refused}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn inked(text: &str, ink: &[((usize, usize), Rgb)]) -> Canvas {
         let mut canvas = Canvas::from_text(text).expect("valid");
         for ((x, y), color) in ink {
@@ -554,8 +673,143 @@ mod tests {
 
     #[test]
     fn trailing_spaces_are_trimmed_but_inner_ones_kept() {
+        // Save for the longest row, trimmed, which carries the drawing's width out to its end —
+        // the fewest spaces that do.
         let doc = parse("ab   \n  c  \n").expect("valid");
-        assert_eq!(render(&doc.canvas, &doc.palette), "ab\n  c\n");
+        assert_eq!(render(&doc.canvas, &doc.palette), "ab\n  c  \n");
+        let doc = parse("ab   \n  c\n").expect("valid");
+        assert_eq!(render(&doc.canvas, &doc.palette), "ab\n  c  \n", "the longest, not the first");
+        let doc = parse("ab   \ncd\n").expect("valid");
+        assert_eq!(render(&doc.canvas, &doc.palette), "ab   \ncd\n", "of two as long, the first");
+    }
+
+    /// A coloured space at the end of a row is written — its colour draws nothing today, but the
+    /// space may be made a character, and then the colour must be there — and read back coloured.
+    #[test]
+    fn a_coloured_space_at_the_end_of_a_row_is_kept() {
+        let mut palette = Palette::new();
+        palette.push("ember", RED).expect("fresh");
+        let canvas = inked("ab  \ncdef", &[((3, 0), RED)]);
+        let text = render(&canvas, &palette);
+        assert!(text.starts_with("ab \x1b[38;2;226;57;57m \x1b[0m\n"), "{text:?}");
+        assert_eq!(parse(&text).expect("reads").canvas, canvas);
+    }
+
+    /// A drawing of nothing but spaces is still written as one that reads back: its first row
+    /// carries the width, where bare newlines would be no drawing at all.
+    #[test]
+    fn a_drawing_of_nothing_but_spaces_reads_back() {
+        let canvas = Canvas::from_text("   \n   ").expect("valid");
+        let text = render(&canvas, &Palette::new());
+        assert_eq!(text, "   \n\n");
+        assert_eq!(parse(&text).expect("reads").canvas, canvas);
+    }
+
+    /// A blank grid painted only near its left edge comes back as wide as it was, the rest of it
+    /// still there to paint.
+    #[test]
+    fn a_drawing_comes_back_the_size_it_was() {
+        let mut palette = Palette::new();
+        palette.push("ember", RED).expect("fresh");
+        let canvas = inked(&["          "; 4].join("\n"), &[((0, 1), RED), ((2, 3), RED)]);
+        let back = parse(&render(&canvas, &palette)).expect("reads");
+        assert_eq!((back.canvas.width(), back.canvas.height()), (10, 4));
+        assert_eq!(back.canvas, canvas);
+    }
+
+    /// A palette holding every kind of ink: colours of their own, and a slot from each of the
+    /// three ranges the terminal's palette has.
+    fn every_kind_of_ink() -> Palette {
+        let mut palette = Palette::new();
+        for n in 0..4u8 {
+            palette.push(format!("c{n}"), Rgb::new(n * 60, 90, 200)).expect("distinct");
+        }
+        for slot in [3, 9, 196] {
+            palette.push(format!("slot {slot}"), Ink::Slot(slot)).expect("free");
+        }
+        palette
+    }
+
+    /// `rows`, as a canvas, with `ink` on the cells listed, by the palette's position.
+    fn made(rows: &[&str], ink: &[((usize, usize), usize)], palette: &Palette) -> Canvas {
+        let mut canvas = Canvas::from_text(&rows.join("\n")).expect("valid");
+        for &((x, y), at) in ink {
+            canvas.cell_mut(x, y).expect("inside").ink = palette.at(at).map(|s| s.color());
+        }
+        canvas
+    }
+
+    fn reads_back(canvas: &Canvas, palette: &Palette, case: &str) {
+        let text = render(canvas, palette);
+        let back = parse(&text).unwrap_or_else(|why| panic!("{case}: {why}: {text:?}"));
+        assert_eq!(back.canvas, *canvas, "{case}: {text:?}");
+        assert_eq!(back.palette, *palette, "{case}");
+    }
+
+    /// A drawing made to a shape: what it is, its rows, and the colours on it — each a cell and a
+    /// palette position.
+    type Shape<'a> = (&'a str, &'a [&'a str], &'a [((usize, usize), usize)]);
+
+    /// The shapes a drawing's read-back is most likely to get wrong, each made on purpose rather
+    /// than hoped for from chance: nothing but spaces, blank rows at the end — the height, which
+    /// the width fix does not touch — a lone colour far to the right, the widest row ending in
+    /// coloured spaces and in plain ones, one column, one row, ragged rows.
+    #[test]
+    fn the_awkward_shapes_read_back_as_they_were() {
+        let palette = every_kind_of_ink();
+        let low_slot = 4; // slot 3, one of the theme's
+        let cases: &[Shape] = &[
+            ("a lone space", &[" "], &[]),
+            ("nothing but spaces", &["   ", "   "], &[]),
+            ("coloured spaces only", &["   ", "   "], &[((2, 1), low_slot)]),
+            ("no blank rows after", &["ab"], &[]),
+            ("one blank row after", &["ab", ""], &[]),
+            ("three blank rows after", &["ab", "", "", ""], &[]),
+            ("blank rows before and between", &["", "ab", "", "c"], &[]),
+            ("a lone colour far right", &["abc", "      ", "de"], &[((5, 1), 0)]),
+            (
+                "the widest ends in coloured spaces",
+                &["ab   ", "cd"],
+                &[((3, 0), low_slot), ((4, 0), 6)],
+            ),
+            ("the widest ends in plain spaces", &["ab   ", "cd"], &[]),
+            ("one column", &["a", " ", "b"], &[((0, 1), 5)]),
+            ("one row", &["a b  "], &[((4, 0), 1)]),
+            ("ragged", &["a", "bcdef", "gh", ""], &[((0, 0), 2), ((4, 1), 3)]),
+            ("every row as wide", &["abc", "def"], &[((2, 1), 6)]),
+        ];
+        for (case, rows, ink) in cases {
+            reads_back(&made(rows, ink, &palette), &palette, case);
+        }
+    }
+
+    /// For any drawing whatever — ragged, with spaces inside and at the ends of rows, colour of
+    /// every kind on them, blank rows — what is written reads back as the drawing it was: the
+    /// same cells, the same colours, the same size, and the same palette.
+    #[test]
+    fn every_drawing_reads_back_as_the_drawing_it_was() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut below = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let glyphs = [' ', ' ', ' ', '#', 'a', '\u{2588}', '\u{2800}'];
+        let palette = every_kind_of_ink();
+        for case in 0..400 {
+            let height = 1 + below(6);
+            let rows: Vec<String> = (0..height)
+                .map(|_| (0..below(12)).map(|_| glyphs[below(glyphs.len())]).collect())
+                .collect();
+            let Ok(mut canvas) = Canvas::from_text(&rows.join("\n")) else { continue };
+            for _ in 0..below(8) {
+                let (x, y) = (below(canvas.width()), below(canvas.height()));
+                canvas.cell_mut(x, y).expect("inside").ink =
+                    palette.at(below(palette.len())).map(|s| s.color());
+            }
+            reads_back(&canvas, &palette, &format!("case {case}"));
+        }
     }
 
     #[test]

@@ -449,6 +449,52 @@ fn a_colour_typed_in_hex_is_saved_exactly() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// A crumpled save from the running program, with either key: Ctrl+Shift+S on a terminal that
+/// speaks the kitty protocol, Alt+S on one that does not. What lands beside the file is the
+/// drawing crumpled — and the file itself is untouched.
+#[test]
+fn a_crumpled_save_lands_beside_the_file_from_either_key() {
+    let keys: [(Terminal, &[u8], &str); 2] =
+        [(Terminal::Kitty, b"\x1b[115;6u", "kitty"), (Terminal::Classic, b"\x1bs", "classic")];
+    for (terminal, key, name) in keys {
+        let (dir, path) = scratch(&format!("crumple-{name}"), DOTS);
+        let mut session = Session::start(&[path.clone().into()], terminal, true);
+        session.expect("^X/esc close");
+        session.keys(&[key]);
+        session.expect("crumpled to");
+        session.keys(&[b"\x18"]); // ctrl+x: nothing unsaved, so it closes at once
+        let (status, _) = session.finish();
+        assert!(status.success(), "{name}: exit {status}");
+        let crumpled = std::fs::read_to_string(path.with_file_name("art.txt.crumpled"))
+            .unwrap_or_else(|why| panic!("{name}: no crumpled copy: {why}"));
+        let plain = arterminal::crumple::uncrumple(&crumpled).expect("a crumpled form");
+        assert!(plain.starts_with(DOTS.trim_end()), "{name}: the drawing: {plain:?}");
+        assert_eq!(std::fs::read_to_string(&path).expect("readable"), DOTS, "{name}: untouched");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// A drawing opened from its crumpled form, alone in its directory, saves plain with Ctrl+S —
+/// to its name without `.crumpled`, as text — and leaves the crumpled file as it was.
+#[test]
+fn ctrl_s_saves_a_crumpled_drawing_plain_under_its_plain_name() {
+    let (dir, plain) = scratch("uncrumple", "");
+    std::fs::remove_file(&plain).expect("only the crumpled form is there");
+    let crumpled = plain.with_file_name("art.txt.crumpled");
+    let form = arterminal::crumple::crumple(DOTS);
+    std::fs::write(&crumpled, &form).expect("written");
+    let mut session = Session::start(&[crumpled.clone().into()], Terminal::Kitty, true);
+    session.expect("^X/esc close");
+    session.keys(&[b"\x1b[115;5u"]); // ctrl+s
+    session.expect("saved to");
+    session.keys(&[b"\x1b[27u"]);
+    let (status, _) = session.finish();
+    assert!(status.success(), "exit {status}");
+    assert_eq!(std::fs::read_to_string(&plain).expect("a plain file now"), DOTS, "as text");
+    assert_eq!(std::fs::read_to_string(&crumpled).expect("still there"), form, "untouched");
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// A terminal that draws East Asian Ambiguous characters wide is asked, not guessed at: the
 /// probe's `·` is drawn and erased again, and every line of the frame then fits the terminal as
 /// IT measures them — the `·` between hints two columns each.
